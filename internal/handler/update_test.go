@@ -8,14 +8,20 @@ import (
 	"github.com/rebusman/svcmetrics/internal/storage"
 )
 
+func newTestServer(s Storage) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /update/{type}/{name}/{value}", UpdateHandler(s))
+	return mux
+}
+
 func TestUpdateHandlerGauge(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := UpdateHandler(s)
+	mux := newTestServer(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/update/gauge/Alloc/12.5", nil)
 	rec := httptest.NewRecorder()
 
-	h.ServeHTTP(rec, req)
+	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -32,13 +38,13 @@ func TestUpdateHandlerGauge(t *testing.T) {
 
 func TestUpdateHandlerCounter(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := UpdateHandler(s)
+	mux := newTestServer(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/update/counter/PollCount/3", nil)
 	rec := httptest.NewRecorder()
 
-	h.ServeHTTP(rec, req)
-	h.ServeHTTP(rec, req)
+	mux.ServeHTTP(rec, req)
+	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -55,7 +61,7 @@ func TestUpdateHandlerCounter(t *testing.T) {
 
 func TestUpdateHandlerErrors(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := UpdateHandler(s)
+	mux := newTestServer(s)
 
 	tests := []struct {
 		name       string
@@ -67,6 +73,8 @@ func TestUpdateHandlerErrors(t *testing.T) {
 		{name: "wrong type", method: http.MethodPost, path: "/update/unknown/Alloc/1", wantStatus: http.StatusBadRequest},
 		{name: "bad gauge", method: http.MethodPost, path: "/update/gauge/Alloc/not-a-number", wantStatus: http.StatusBadRequest},
 		{name: "bad counter", method: http.MethodPost, path: "/update/counter/PollCount/not-a-number", wantStatus: http.StatusBadRequest},
+		{name: "missing value", method: http.MethodPost, path: "/update/gauge/Alloc", wantStatus: http.StatusNotFound},
+		{name: "missing name and value", method: http.MethodPost, path: "/update/gauge", wantStatus: http.StatusNotFound},
 	}
 
 	for _, tt := range tests {
@@ -74,7 +82,7 @@ func TestUpdateHandlerErrors(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
 
-			h.ServeHTTP(rec, req)
+			mux.ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)

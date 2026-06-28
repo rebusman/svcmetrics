@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 func TestCollectRuntimeMetrics(t *testing.T) {
@@ -26,8 +29,8 @@ func TestCollectRuntimeMetrics(t *testing.T) {
 		t.Fatalf("RandomValue = %v, want value in [0, 1)", got)
 	}
 
-	if got := len(a.metrics.gauges); got != len(gaugeMetricNames) {
-		t.Fatalf("gauge metrics count = %d, want %d", got, len(gaugeMetricNames))
+	if got := len(a.metrics.gauges); got != len(models.GaugeMetricNames) {
+		t.Fatalf("gauge metrics count = %d, want %d", got, len(models.GaugeMetricNames))
 	}
 }
 
@@ -64,12 +67,12 @@ func TestSendMetrics(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, 2, 10)
+	a := New(ts.URL, 2*time.Second, 10*time.Second)
 	a.client = ts.Client()
 
 	a.mu.Lock()
-	a.metrics.gauges = make(map[string]float64, len(gaugeMetricNames))
-	for _, name := range gaugeMetricNames {
+	a.metrics.gauges = make(map[string]float64, len(models.GaugeMetricNames))
+	for _, name := range models.GaugeMetricNames {
 		a.metrics.gauges[name] = 0
 	}
 	a.metrics.gauges["Alloc"] = 1.5
@@ -82,11 +85,11 @@ func TestSendMetrics(t *testing.T) {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
-	expected := make([]string, 0, len(gaugeMetricNames)+len(counterMetricNames))
-	for _, name := range gaugeMetricNames {
+	expected := make([]string, 0, len(models.GaugeMetricNames)+len(models.CounterMetricNames))
+	for _, name := range models.GaugeMetricNames {
 		expected = append(expected, fmt.Sprintf("/update/gauge/%s/%s", name, formatGaugeValue(a.metrics.gauges[name])))
 	}
-	for _, name := range counterMetricNames {
+	for _, name := range models.CounterMetricNames {
 		expected = append(expected, fmt.Sprintf("/update/counter/%s/%d", name, a.metrics.counters[name]-2))
 	}
 

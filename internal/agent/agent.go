@@ -1,54 +1,25 @@
 package agent
 
 import (
+	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 const (
 	defaultServerAddress  = "http://localhost:8080"
-	defaultPollInterval   = 2
-	defaultReportInterval = 10
+	defaultPollInterval   = 2 * time.Second
+	defaultReportInterval = 10 * time.Second
+	clientTimeout         = 5 * time.Second
 )
-
-var gaugeMetricNames = []string{
-	"Alloc",
-	"BuckHashSys",
-	"Frees",
-	"GCCPUFraction",
-	"GCSys",
-	"HeapAlloc",
-	"HeapIdle",
-	"HeapInuse",
-	"HeapObjects",
-	"HeapReleased",
-	"HeapSys",
-	"LastGC",
-	"Lookups",
-	"MCacheInuse",
-	"MCacheSys",
-	"MSpanInuse",
-	"MSpanSys",
-	"Mallocs",
-	"NextGC",
-	"NumForcedGC",
-	"NumGC",
-	"OtherSys",
-	"PauseTotalNs",
-	"StackInuse",
-	"StackSys",
-	"Sys",
-	"TotalAlloc",
-	"RandomValue",
-}
-
-var counterMetricNames = []string{"PollCount"}
 
 type metricState struct {
 	gauges   map[string]float64
@@ -58,149 +29,140 @@ type metricState struct {
 type Agent struct {
 	endpoint string
 	client   *http.Client
-	rng      *rand.Rand
 
-	pollIntervalSec   int
-	reportIntervalSec int
+	pollInterval   time.Duration
+	reportInterval time.Duration
 
 	mu               sync.RWMutex
 	metrics          metricState
 	lastSentCounters map[string]int64
 }
 
-func New(endpoint string, pollIntervalSec, reportIntervalSec int) *Agent {
+func New(endpoint string, pollInterval, reportInterval time.Duration) *Agent {
 	if endpoint == "" {
 		endpoint = defaultServerAddress
 	}
-	if pollIntervalSec <= 0 {
-		pollIntervalSec = defaultPollInterval
+	if pollInterval <= 0 {
+		pollInterval = defaultPollInterval
 	}
-	if reportIntervalSec <= 0 {
-		reportIntervalSec = defaultReportInterval
+	if reportInterval <= 0 {
+		reportInterval = defaultReportInterval
 	}
 
 	return &Agent{
-		endpoint:          strings.TrimRight(endpoint, "/"),
-		client:            &http.Client{Timeout: 5 * time.Second},
-		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
-		pollIntervalSec:   pollIntervalSec,
-		reportIntervalSec: reportIntervalSec,
+		endpoint:       strings.TrimRight(endpoint, "/"),
+		client:         &http.Client{Timeout: clientTimeout},
+		pollInterval:   pollInterval,
+		reportInterval: reportInterval,
 		metrics: metricState{
-			gauges:   make(map[string]float64, len(gaugeMetricNames)),
-			counters: make(map[string]int64, len(counterMetricNames)),
+			gauges:   make(map[string]float64, len(models.GaugeMetricNames)),
+			counters: make(map[string]int64, len(models.CounterMetricNames)),
 		},
-		lastSentCounters: make(map[string]int64, len(counterMetricNames)),
+		lastSentCounters: make(map[string]int64, len(models.CounterMetricNames)),
 	}
 }
 
-func (a *Agent) Run() {
-	go func() {
-		for {
-			time.Sleep(time.Duration(a.pollIntervalSec) * time.Second)
-			a.CollectRuntimeMetrics()
-		}
-	}()
+// Run collects and reports metrics until the context is cancelled.
+func (a *Agent) Run(ctx context.Context) {
+	pollTicker := time.NewTicker(a.pollInterval)
+	defer pollTicker.Stop()
+
+	reportTicker := time.NewTicker(a.reportInterval)
+	defer reportTicker.Stop()
 
 	for {
-		time.Sleep(time.Duration(a.reportIntervalSec) * time.Second)
-		_ = a.SendMetrics()
+		select {
+		case <-ctx.Done():
+			return
+		case <-pollTicker.C:
+			a.CollectRuntimeMetrics()
+		case <-reportTicker.C:
+			_ = a.SendMetrics()
+		}
 	}
 }
 
 func (a *Agent) CollectRuntimeMetrics() {
-	a.ensureInitialized()
-
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+
+	values := map[string]float64{
+		"Alloc":            float64(ms.Alloc),
+		"BuckHashSys":      float64(ms.BuckHashSys),
+		"Frees":            float64(ms.Frees),
+		"GCCPUFraction":    ms.GCCPUFraction,
+		"GCSys":            float64(ms.GCSys),
+		"HeapAlloc":        float64(ms.HeapAlloc),
+		"HeapIdle":         float64(ms.HeapIdle),
+		"HeapInuse":        float64(ms.HeapInuse),
+		"HeapObjects":      float64(ms.HeapObjects),
+		"HeapReleased":     float64(ms.HeapReleased),
+		"HeapSys":          float64(ms.HeapSys),
+		"LastGC":           float64(ms.LastGC),
+		"Lookups":          float64(ms.Lookups),
+		"MCacheInuse":      float64(ms.MCacheInuse),
+		"MCacheSys":        float64(ms.MCacheSys),
+		"MSpanInuse":       float64(ms.MSpanInuse),
+		"MSpanSys":         float64(ms.MSpanSys),
+		"Mallocs":          float64(ms.Mallocs),
+		"NextGC":           float64(ms.NextGC),
+		"NumForcedGC":      float64(ms.NumForcedGC),
+		"NumGC":            float64(ms.NumGC),
+		"OtherSys":         float64(ms.OtherSys),
+		"PauseTotalNs":     float64(ms.PauseTotalNs),
+		"StackInuse":       float64(ms.StackInuse),
+		"StackSys":         float64(ms.StackSys),
+		"Sys":              float64(ms.Sys),
+		"TotalAlloc":       float64(ms.TotalAlloc),
+		models.RandomValue: rand.Float64(),
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.metrics.gauges["Alloc"] = float64(ms.Alloc)
-	a.metrics.gauges["BuckHashSys"] = float64(ms.BuckHashSys)
-	a.metrics.gauges["Frees"] = float64(ms.Frees)
-	a.metrics.gauges["GCCPUFraction"] = ms.GCCPUFraction
-	a.metrics.gauges["GCSys"] = float64(ms.GCSys)
-	a.metrics.gauges["HeapAlloc"] = float64(ms.HeapAlloc)
-	a.metrics.gauges["HeapIdle"] = float64(ms.HeapIdle)
-	a.metrics.gauges["HeapInuse"] = float64(ms.HeapInuse)
-	a.metrics.gauges["HeapObjects"] = float64(ms.HeapObjects)
-	a.metrics.gauges["HeapReleased"] = float64(ms.HeapReleased)
-	a.metrics.gauges["HeapSys"] = float64(ms.HeapSys)
-	a.metrics.gauges["LastGC"] = float64(ms.LastGC)
-	a.metrics.gauges["Lookups"] = float64(ms.Lookups)
-	a.metrics.gauges["MCacheInuse"] = float64(ms.MCacheInuse)
-	a.metrics.gauges["MCacheSys"] = float64(ms.MCacheSys)
-	a.metrics.gauges["MSpanInuse"] = float64(ms.MSpanInuse)
-	a.metrics.gauges["MSpanSys"] = float64(ms.MSpanSys)
-	a.metrics.gauges["Mallocs"] = float64(ms.Mallocs)
-	a.metrics.gauges["NextGC"] = float64(ms.NextGC)
-	a.metrics.gauges["NumForcedGC"] = float64(ms.NumForcedGC)
-	a.metrics.gauges["NumGC"] = float64(ms.NumGC)
-	a.metrics.gauges["OtherSys"] = float64(ms.OtherSys)
-	a.metrics.gauges["PauseTotalNs"] = float64(ms.PauseTotalNs)
-	a.metrics.gauges["StackInuse"] = float64(ms.StackInuse)
-	a.metrics.gauges["StackSys"] = float64(ms.StackSys)
-	a.metrics.gauges["Sys"] = float64(ms.Sys)
-	a.metrics.gauges["TotalAlloc"] = float64(ms.TotalAlloc)
-	a.metrics.gauges["RandomValue"] = a.rng.Float64()
-
-	a.metrics.counters["PollCount"]++
+	for name, value := range values {
+		a.metrics.gauges[name] = value
+	}
+	a.metrics.counters[models.PollCount]++
 }
 
 func (a *Agent) SendMetrics() error {
-	a.ensureInitialized()
+	gauges, counterDeltas := a.snapshotForReport()
 
-	gauges, counters := a.snapshotMetrics()
-
-	for _, name := range gaugeMetricNames {
-		if err := a.sendMetric("gauge", name, formatGaugeValue(gauges[name])); err != nil {
+	for _, name := range models.GaugeMetricNames {
+		if err := a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name])); err != nil {
 			return err
 		}
 	}
 
-	for _, name := range counterMetricNames {
-		current := counters[name]
-		previous := a.lastSentCounter(name)
-		delta := current - previous
-		if err := a.sendMetric("counter", name, strconv.FormatInt(delta, 10)); err != nil {
+	for _, name := range models.CounterMetricNames {
+		if err := a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10)); err != nil {
 			return err
 		}
-		a.setLastSentCounter(name, current)
 	}
 
 	return nil
 }
 
-func (a *Agent) snapshotMetrics() (map[string]float64, map[string]int64) {
-	a.ensureInitialized()
-
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+// snapshotForReport copies gauges and computes counter deltas under a single lock,
+// also marking the counters as sent.
+func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	gauges := make(map[string]float64, len(a.metrics.gauges))
 	for k, v := range a.metrics.gauges {
 		gauges[k] = v
 	}
 
-	counters := make(map[string]int64, len(a.metrics.counters))
-	for k, v := range a.metrics.counters {
-		counters[k] = v
+	deltas := make(map[string]int64, len(models.CounterMetricNames))
+	for _, name := range models.CounterMetricNames {
+		current := a.metrics.counters[name]
+		deltas[name] = current - a.lastSentCounters[name]
+		a.lastSentCounters[name] = current
 	}
 
-	return gauges, counters
-}
-
-func (a *Agent) lastSentCounter(name string) int64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.lastSentCounters[name]
-}
-
-func (a *Agent) setLastSentCounter(name string, value int64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.lastSentCounters[name] = value
+	return gauges, deltas
 }
 
 func (a *Agent) sendMetric(metricType, name, value string) error {
@@ -228,25 +190,4 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 
 func formatGaugeValue(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
-}
-
-func (a *Agent) ensureInitialized() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.client == nil {
-		a.client = &http.Client{Timeout: 5 * time.Second}
-	}
-	if a.rng == nil {
-		a.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	}
-	if a.metrics.gauges == nil {
-		a.metrics.gauges = make(map[string]float64, len(gaugeMetricNames))
-	}
-	if a.metrics.counters == nil {
-		a.metrics.counters = make(map[string]int64, len(counterMetricNames))
-	}
-	if a.lastSentCounters == nil {
-		a.lastSentCounters = make(map[string]int64, len(counterMetricNames))
-	}
 }
