@@ -49,3 +49,23 @@ func (s *MemStorage) GetCounter(name string) (int64, error) {
 	}
 	return val, nil
 }
+
+func (s *MemStorage) GetAllGauges() map[string]float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]float64, len(s.gauges))
+	for k, v := range s.gauges {
+		res[k] = v
+	}
+	return res
+}
+
+func (s *MemStorage) GetAllCounters() map[string]int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]int64, len(s.counters))
+	for k, v := range s.counters {
+		res[k] = v
+	}
+	return res
+}

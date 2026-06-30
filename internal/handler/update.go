@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/go-chi/chi/v5"
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
@@ -13,14 +14,16 @@ type Storage interface {
 	UpdateCounter(name string, value int64)
 	GetGauge(name string) (float64, error)
 	GetCounter(name string) (int64, error)
+	GetAllGauges() map[string]float64
+	GetAllCounters() map[string]int64
 }
 
 // UpdateHandler handles POST /update/{type}/{name}/{value}.
 func UpdateHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		mType := r.PathValue("type")
-		mName := r.PathValue("name")
-		mValueStr := r.PathValue("value")
+		mType := chi.URLParam(r, "type")
+		mName := chi.URLParam(r, "name")
+		mValueStr := chi.URLParam(r, "value")
 
 		if mName == "" {
 			http.Error(w, "Metric name missing", http.StatusNotFound)
