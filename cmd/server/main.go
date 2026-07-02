@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os/signal"
@@ -15,6 +16,9 @@ import (
 )
 
 func main() {
+	addr := flag.String("a", "localhost:8080", "address and port to run server")
+	flag.Parse()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -26,7 +30,7 @@ func main() {
 	r.Get("/", handler.ListHandler(s))
 
 	srv := &http.Server{
-		Addr:              "localhost:8080",
+		Addr:              *addr,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
