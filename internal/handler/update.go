@@ -9,13 +9,21 @@ import (
 )
 
 // Storage describes the metric storage used by the handler.
-type Storage interface {
-	UpdateGauge(name string, value float64)
-	UpdateCounter(name string, value int64)
+type ReadStorage interface {
 	GetGauge(name string) (float64, error)
 	GetCounter(name string) (int64, error)
 	GetAllGauges() map[string]float64
 	GetAllCounters() map[string]int64
+}
+
+type WriteStorage interface {
+	UpdateGauge(name string, value float64)
+	UpdateCounter(name string, value int64)
+}
+
+type Storage interface {
+	ReadStorage
+	WriteStorage
 }
 
 // UpdateHandler handles POST /update/{type}/{name}/{value}.
