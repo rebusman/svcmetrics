@@ -6,10 +6,9 @@ import (
 )
 
 type MemStorage struct {
-	gaugeMu   sync.RWMutex
-	counterMu sync.RWMutex
-	gauges    map[string]float64
-	counters  map[string]int64
+	mu       sync.RWMutex
+	gauges   map[string]float64
+	counters map[string]int64
 }
 
 func NewMemStorage() *MemStorage {
@@ -19,28 +18,21 @@ func NewMemStorage() *MemStorage {
 	}
 }
 
-type Storage interface {
-	UpdateGauge(name string, value float64)
-	UpdateCounter(name string, value int64)
-	GetGauge(name string) (float64, error)
-	GetCounter(name string) (int64, error)
-}
-
 func (s *MemStorage) UpdateGauge(name string, value float64) {
-	s.gaugeMu.Lock()
-	defer s.gaugeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.gauges[name] = value
 }
 
 func (s *MemStorage) UpdateCounter(name string, value int64) {
-	s.counterMu.Lock()
-	defer s.counterMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.counters[name] += value
 }
 
 func (s *MemStorage) GetGauge(name string) (float64, error) {
-	s.gaugeMu.RLock()
-	defer s.gaugeMu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	val, ok := s.gauges[name]
 	if !ok {
 		return 0, errors.New("gauge not found")
@@ -49,8 +41,8 @@ func (s *MemStorage) GetGauge(name string) (float64, error) {
 }
 
 func (s *MemStorage) GetCounter(name string) (int64, error) {
-	s.counterMu.RLock()
-	defer s.counterMu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	val, ok := s.counters[name]
 	if !ok {
 		return 0, errors.New("counter not found")

@@ -3,49 +3,39 @@ package handler
 import (
 	"net/http"
 	"strconv"
-	"strings"
 
-	"github.com/rebusman/svcmetrics/internal/storage"
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
-func UpdateHandler(s storage.Storage) http.HandlerFunc {
+// Storage describes the metric storage used by the handler.
+type Storage interface {
+	UpdateGauge(name string, value float64)
+	UpdateCounter(name string, value int64)
+	GetGauge(name string) (float64, error)
+	GetCounter(name string) (int64, error)
+}
+
+// UpdateHandler handles POST /update/{type}/{name}/{value}.
+func UpdateHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+		mType := r.PathValue("type")
+		mName := r.PathValue("name")
+		mValueStr := r.PathValue("value")
 
-		// URL format: /update/<TYPE>/<NAME>/<VALUE>
-		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-
-		if len(parts) < 2 || parts[0] != "update" {
-			http.Error(w, "Invalid path", http.StatusNotFound)
-			return
-		}
-
-		if len(parts) < 3 {
+		if mName == "" {
 			http.Error(w, "Metric name missing", http.StatusNotFound)
 			return
 		}
 
-		if len(parts) < 4 {
-			http.Error(w, "Metric value missing", http.StatusBadRequest)
-			return
-		}
-
-		mType := parts[1]
-		mName := parts[2]
-		mValueStr := parts[3]
-
 		switch mType {
-		case "gauge":
+		case models.Gauge:
 			val, err := strconv.ParseFloat(mValueStr, 64)
 			if err != nil {
 				http.Error(w, "Invalid gauge value", http.StatusBadRequest)
 				return
 			}
 			s.UpdateGauge(mName, val)
-		case "counter":
+		case models.Counter:
 			val, err := strconv.ParseInt(mValueStr, 10, 64)
 			if err != nil {
 				http.Error(w, "Invalid counter value", http.StatusBadRequest)
