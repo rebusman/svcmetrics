@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	"github.com/rebusman/svcmetrics/internal/storage"
 )
@@ -19,12 +20,14 @@ func main() {
 
 	s := storage.NewMemStorage()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /update/{type}/{name}/{value}", handler.UpdateHandler(s))
+	r := chi.NewRouter()
+	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(s))
+	r.Get("/value/{type}/{name}", handler.ValueHandler(s))
+	r.Get("/", handler.ListHandler(s))
 
 	srv := &http.Server{
 		Addr:              "localhost:8080",
-		Handler:           mux,
+		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

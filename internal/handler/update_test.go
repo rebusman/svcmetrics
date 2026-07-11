@@ -5,23 +5,26 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rebusman/svcmetrics/internal/storage"
 )
 
-func newTestServer(s Storage) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /update/{type}/{name}/{value}", UpdateHandler(s))
-	return mux
+func newTestRouter(s Storage) chi.Router {
+	r := chi.NewRouter()
+	r.Post("/update/{type}/{name}/{value}", UpdateHandler(s))
+	r.Get("/value/{type}/{name}", ValueHandler(s))
+	r.Get("/", ListHandler(s))
+	return r
 }
 
 func TestUpdateHandlerGauge(t *testing.T) {
 	s := storage.NewMemStorage()
-	mux := newTestServer(s)
+	r := newTestRouter(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/update/gauge/Alloc/12.5", nil)
 	rec := httptest.NewRecorder()
 
-	mux.ServeHTTP(rec, req)
+	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -38,16 +41,19 @@ func TestUpdateHandlerGauge(t *testing.T) {
 
 func TestUpdateHandlerCounter(t *testing.T) {
 	s := storage.NewMemStorage()
-	mux := newTestServer(s)
+	r := newTestRouter(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/update/counter/PollCount/3", nil)
 	rec := httptest.NewRecorder()
 
-	mux.ServeHTTP(rec, req)
-	mux.ServeHTTP(rec, req)
+	r.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	req2 := httptest.NewRequest(http.MethodPost, "/update/counter/PollCount/3", nil)
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec2.Code, http.StatusOK)
 	}
 
 	got, err := s.GetCounter("PollCount")
@@ -59,34 +65,54 @@ func TestUpdateHandlerCounter(t *testing.T) {
 	}
 }
 
-func TestUpdateHandlerErrors(t *testing.T) {
+func TestValueHandler(t *testing.T) {
 	s := storage.NewMemStorage()
-	mux := newTestServer(s)
+	s.UpdateGauge("Alloc", 12.5)
+	s.UpdateCounter("PollCount", 5)
+	r := newTestRouter(s)
 
 	tests := []struct {
 		name       string
-		method     string
 		path       string
 		wantStatus int
+		wantBody   string
 	}{
-		{name: "wrong method", method: http.MethodGet, path: "/update/gauge/Alloc/1", wantStatus: http.StatusMethodNotAllowed},
-		{name: "wrong type", method: http.MethodPost, path: "/update/unknown/Alloc/1", wantStatus: http.StatusBadRequest},
-		{name: "bad gauge", method: http.MethodPost, path: "/update/gauge/Alloc/not-a-number", wantStatus: http.StatusBadRequest},
-		{name: "bad counter", method: http.MethodPost, path: "/update/counter/PollCount/not-a-number", wantStatus: http.StatusBadRequest},
-		{name: "missing value", method: http.MethodPost, path: "/update/gauge/Alloc", wantStatus: http.StatusNotFound},
-		{name: "missing name and value", method: http.MethodPost, path: "/update/gauge", wantStatus: http.StatusNotFound},
+		{"gauge ok", "/value/gauge/Alloc", http.StatusOK, "12.5"},
+		{"counter ok", "/value/counter/PollCount", http.StatusOK, "5"},
+		{"gauge not found", "/value/gauge/Unknown", http.StatusNotFound, ""},
+		{"counter not found", "/value/counter/Unknown", http.StatusNotFound, ""},
+		{"invalid type", "/value/unknown/Alloc", http.StatusNotFound, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
-
-			mux.ServeHTTP(rec, req)
+			r.ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if tt.wantStatus == http.StatusOK && rec.Body.String() != tt.wantBody {
+				t.Errorf("body = %s, want %s", rec.Body.String(), tt.wantBody)
 			}
 		})
+	}
+}
+
+func TestListHandler(t *testing.T) {
+	s := storage.NewMemStorage()
+	s.UpdateGauge("Alloc", 12.5)
+	r := newTestRouter(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Header().Get("Content-Type") != "text/html" {
+		t.Errorf("content type = %s, want text/html", rec.Header().Get("Content-Type"))
 	}
 }
