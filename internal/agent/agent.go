@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
@@ -129,19 +131,23 @@ func (a *Agent) CollectRuntimeMetrics() {
 func (a *Agent) SendMetrics() error {
 	gauges, counterDeltas := a.snapshotForReport()
 
+	var g errgroup.Group
+
 	for _, name := range models.GaugeMetricNames {
-		if err := a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name])); err != nil {
-			return err
-		}
+		name := name
+		g.Go(func() error {
+			return a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name]))
+		})
 	}
 
 	for _, name := range models.CounterMetricNames {
-		if err := a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10)); err != nil {
-			return err
-		}
+		name := name
+		g.Go(func() error {
+			return a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10))
+		})
 	}
 
-	return nil
+	return g.Wait()
 }
 
 // snapshotForReport copies gauges and computes counter deltas under a single lock,
