@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
@@ -19,6 +21,9 @@ const (
 	defaultPollInterval   = 2 * time.Second
 	defaultReportInterval = 10 * time.Second
 	clientTimeout         = 5 * time.Second
+
+	reportMaxAttempts   = 3
+	reportRetryInterval = 1 * time.Second
 )
 
 type metricState struct {
@@ -77,9 +82,33 @@ func (a *Agent) Run(ctx context.Context) {
 		case <-pollTicker.C:
 			a.CollectRuntimeMetrics()
 		case <-reportTicker.C:
-			_ = a.SendMetrics()
+			a.reportWithRetry(ctx)
 		}
 	}
+}
+
+// reportWithRetry sends metrics, retrying on failure up to reportMaxAttempts
+// times with a fixed backoff. It stops early if the context is cancelled.
+func (a *Agent) reportWithRetry(ctx context.Context) {
+	var err error
+	for attempt := 1; attempt <= reportMaxAttempts; attempt++ {
+		if err = a.SendMetrics(); err == nil {
+			return
+		}
+
+		if attempt == reportMaxAttempts {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reportRetryInterval):
+		}
+	}
+
+	// All attempts failed; keep the agent running and try again on the next tick.
+	_ = err
 }
 
 func (a *Agent) CollectRuntimeMetrics() {
@@ -129,19 +158,23 @@ func (a *Agent) CollectRuntimeMetrics() {
 func (a *Agent) SendMetrics() error {
 	gauges, counterDeltas := a.snapshotForReport()
 
+	var g errgroup.Group
+
 	for _, name := range models.GaugeMetricNames {
-		if err := a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name])); err != nil {
-			return err
-		}
+		name := name
+		g.Go(func() error {
+			return a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name]))
+		})
 	}
 
 	for _, name := range models.CounterMetricNames {
-		if err := a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10)); err != nil {
-			return err
-		}
+		name := name
+		g.Go(func() error {
+			return a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10))
+		})
 	}
 
-	return nil
+	return g.Wait()
 }
 
 // snapshotForReport copies gauges and computes counter deltas under a single lock,

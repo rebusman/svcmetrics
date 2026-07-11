@@ -85,24 +85,31 @@ func TestSendMetrics(t *testing.T) {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
-	expected := make([]string, 0, len(models.GaugeMetricNames)+len(models.CounterMetricNames))
+	expectedSet := make(map[string]int, len(models.GaugeMetricNames)+len(models.CounterMetricNames))
 	for _, name := range models.GaugeMetricNames {
-		expected = append(expected, fmt.Sprintf("/update/gauge/%s/%s", name, formatGaugeValue(a.metrics.gauges[name])))
+		p := fmt.Sprintf("/update/gauge/%s/%s", name, formatGaugeValue(a.metrics.gauges[name]))
+		expectedSet[p]++
 	}
 	for _, name := range models.CounterMetricNames {
-		expected = append(expected, fmt.Sprintf("/update/counter/%s/%d", name, a.metrics.counters[name]-2))
+		p := fmt.Sprintf("/update/counter/%s/%d", name, a.metrics.counters[name]-2)
+		expectedSet[p]++
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if len(recorded) != len(expected) {
-		t.Fatalf("requests count = %d, want %d", len(recorded), len(expected))
+	if len(recorded) != len(expectedSet) {
+		t.Fatalf("requests count = %d, want %d", len(recorded), len(expectedSet))
 	}
 
-	for i := range expected {
-		if recorded[i] != expected[i] {
-			t.Fatalf("request %d path = %q, want %q", i, recorded[i], expected[i])
+	recordedSet := make(map[string]int, len(recorded))
+	for _, p := range recorded {
+		recordedSet[p]++
+	}
+
+	for path, want := range expectedSet {
+		if got := recordedSet[path]; got != want {
+			t.Fatalf("path %q count = %d, want %d", path, got, want)
 		}
 	}
 
