@@ -9,6 +9,26 @@ import (
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
+var listTmpl = template.Must(template.New("metrics").Parse(`
+<html>
+<head><title>Metrics</title></head>
+<body>
+	<h1>Metrics</h1>
+	<h2>Gauges</h2>
+	<ul>
+	{{range $name, $value := .Gauges}}
+		<li>{{$name}}: {{$value}}</li>
+	{{end}}
+	</ul>
+	<h2>Counters</h2>
+	<ul>
+	{{range $name, $value := .Counters}}
+		<li>{{$name}}: {{$value}}</li>
+	{{end}}
+	</ul>
+</body>
+</html>`))
+
 // ValueHandler handles GET /value/{type}/{name}.
 func ValueHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -46,29 +66,6 @@ func ValueHandler(s Storage) http.HandlerFunc {
 
 // ListHandler handles GET /.
 func ListHandler(s Storage) http.HandlerFunc {
-	tmpl, err := template.New("metrics").Parse(`
-<html>
-<head><title>Metrics</title></head>
-<body>
-	<h1>Metrics</h1>
-	<h2>Gauges</h2>
-	<ul>
-	{{range $name, $value := .Gauges}}
-		<li>{{$name}}: {{$value}}</li>
-	{{end}}
-	</ul>
-	<h2>Counters</h2>
-	<ul>
-	{{range $name, $value := .Counters}}
-		<li>{{$name}}: {{$value}}</li>
-	{{end}}
-	</ul>
-</body>
-</html>`)
-	if err != nil {
-		panic(err)
-	}
-
 	return func(w http.ResponseWriter, r *http.Request) {
 		data := struct {
 			Gauges   map[string]float64
@@ -80,7 +77,7 @@ func ListHandler(s Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
-		if err := tmpl.Execute(w, data); err != nil {
+		if err := listTmpl.Execute(w, data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
