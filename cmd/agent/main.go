@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"log"
 	"os"
 	"os/signal"
 	"strconv"
@@ -22,14 +23,20 @@ func main() {
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
 	}
+
 	if envReport := os.Getenv("REPORT_INTERVAL"); envReport != "" {
 		if v, err := strconv.Atoi(envReport); err == nil {
 			*reportInterval = v
+		} else {
+			log.Printf("Invalid REPORT_INTERVAL value: %s, using default\n", envReport)
 		}
 	}
+
 	if envPoll := os.Getenv("POLL_INTERVAL"); envPoll != "" {
 		if v, err := strconv.Atoi(envPoll); err == nil {
 			*pollInterval = v
+		} else {
+			log.Printf("Invalid POLL_INTERVAL value: %s, using default\n", envPoll)
 		}
 	}
 
