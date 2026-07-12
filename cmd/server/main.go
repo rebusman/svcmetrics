@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -18,6 +19,10 @@ import (
 func main() {
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	flag.Parse()
+
+	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
+		*addr = envAddr
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
