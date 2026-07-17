@@ -32,7 +32,11 @@ func UpdateJSONHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			if err.Error() == "EOF" {
+				http.Error(w, "Empty body", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			}
 			return
 		}
 
@@ -41,6 +45,10 @@ func UpdateJSONHandler(s Storage) http.HandlerFunc {
 			return
 		}
 
+		var result models.Metrics
+		result.ID = m.ID
+		result.MType = m.MType
+
 		switch m.MType {
 		case models.Gauge:
 			if m.Value == nil {
@@ -48,12 +56,16 @@ func UpdateJSONHandler(s Storage) http.HandlerFunc {
 				return
 			}
 			s.UpdateGauge(m.ID, *m.Value)
+			val, _ := s.GetGauge(m.ID)
+			result.Value = &val
 		case models.Counter:
 			if m.Delta == nil {
 				http.Error(w, "Delta missing for counter", http.StatusBadRequest)
 				return
 			}
 			s.UpdateCounter(m.ID, *m.Delta)
+			val, _ := s.GetCounter(m.ID)
+			result.Delta = &val
 		default:
 			http.Error(w, "Invalid metric type", http.StatusBadRequest)
 			return
@@ -61,6 +73,9 @@ func UpdateJSONHandler(s Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
 	}
 }
 
