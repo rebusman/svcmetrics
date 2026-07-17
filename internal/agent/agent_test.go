@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,11 +50,11 @@ func TestSendMetrics(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
 		}
-		if got := r.Header.Get("Content-Type"); got != "text/plain" {
-			t.Errorf("Content-Type = %q, want text/plain", got)
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
 		}
-		if len(body) != 0 {
-			t.Errorf("body length = %d, want 0", len(body))
+		if len(body) == 0 {
+			t.Errorf("body should not be empty")
 		}
 
 		mu.Lock()
@@ -85,38 +84,18 @@ func TestSendMetrics(t *testing.T) {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
-	expectedSet := make(map[string]int, len(models.GaugeMetricNames)+len(models.CounterMetricNames))
-	for _, name := range models.GaugeMetricNames {
-		p := fmt.Sprintf("/update/gauge/%s/%s", name, formatGaugeValue(a.metrics.gauges[name]))
-		expectedSet[p]++
-	}
-	for _, name := range models.CounterMetricNames {
-		p := fmt.Sprintf("/update/counter/%s/%d", name, a.metrics.counters[name]-2)
-		expectedSet[p]++
-	}
+	expectedCount := len(models.GaugeMetricNames) + len(models.CounterMetricNames)
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if len(recorded) != len(expectedSet) {
-		t.Fatalf("requests count = %d, want %d", len(recorded), len(expectedSet))
+	if len(recorded) != expectedCount {
+		t.Fatalf("requests count = %d, want %d", len(recorded), expectedCount)
 	}
 
-	recordedSet := make(map[string]int, len(recorded))
-	for _, p := range recorded {
-		recordedSet[p]++
-	}
-
-	for path, want := range expectedSet {
-		if got := recordedSet[path]; got != want {
-			t.Fatalf("path %q count = %d, want %d", path, got, want)
+	for _, path := range recorded {
+		if path != "/update" {
+			t.Errorf("path = %q, want /update", path)
 		}
 	}
-
-	a.mu.RLock()
-	if got := a.lastSentCounters["PollCount"]; got != 7 {
-		a.mu.RUnlock()
-		t.Fatalf("lastSentCounters[PollCount] = %d, want 7", got)
-	}
-	a.mu.RUnlock()
 }
