@@ -76,8 +76,10 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(loggingMiddleware(log))
 
+	r.Post("/update", handler.UpdateJSONHandler(s))
 	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(s))
 	r.Get("/value/{type}/{name}", handler.ValueHandler(s))
+	r.Post("/value", handler.ValueJSONHandler(s))
 	r.Get("/", handler.ListHandler(s))
 
 	srv := &http.Server{

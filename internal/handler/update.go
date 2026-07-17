@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -24,6 +25,43 @@ type WriteStorage interface {
 type Storage interface {
 	ReadStorage
 	WriteStorage
+}
+
+// UpdateJSONHandler handles POST /update.
+func UpdateJSONHandler(s Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var m models.Metrics
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if m.ID == "" {
+			http.Error(w, "Metric ID missing", http.StatusBadRequest)
+			return
+		}
+
+		switch m.MType {
+		case models.Gauge:
+			if m.Value == nil {
+				http.Error(w, "Value missing for gauge", http.StatusBadRequest)
+				return
+			}
+			s.UpdateGauge(m.ID, *m.Value)
+		case models.Counter:
+			if m.Delta == nil {
+				http.Error(w, "Delta missing for counter", http.StatusBadRequest)
+				return
+			}
+			s.UpdateCounter(m.ID, *m.Delta)
+		default:
+			http.Error(w, "Invalid metric type", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 // UpdateHandler handles POST /update/{type}/{name}/{value}.
