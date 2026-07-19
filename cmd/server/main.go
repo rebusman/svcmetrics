@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -58,10 +59,29 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 
 func main() {
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
+	storeInterval := flag.Int("i", 300, "save interval in seconds")
+	fileStoragePath := flag.String("f", "metrics_storage.json", "path to storage file")
+	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
+	}
+
+	if envStoreInterval := os.Getenv("STORE_INTERVAL"); envStoreInterval != "" {
+		if v, err := strconv.Atoi(envStoreInterval); err == nil {
+			*storeInterval = v
+		}
+	}
+
+	if envFileStoragePath := os.Getenv("FILE_STORAGE_PATH"); envFileStoragePath != "" {
+		*fileStoragePath = envFileStoragePath
+	}
+
+	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
+		if v, err := strconv.ParseBool(envRestore); err == nil {
+			*restore = v
+		}
 	}
 
 	log := logrus.New()
@@ -73,6 +93,13 @@ func main() {
 	defer stop()
 
 	s := storage.NewMemStorage()
+	if *restore {
+		if err := s.Load(*fileStoragePath); err != nil {
+			log.Errorf("Failed to restore metrics from %s: %v", *fileStoragePath, err)
+		} else {
+			log.Infof("Metrics restored from %s", *fileStoragePath)
+		}
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
@@ -100,6 +127,23 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
+
+	if *storeInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(*storeInterval) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := s.Save(*fileStoragePath); err != nil {
+						log.Errorf("Failed to save metrics to %s: %v", *fileStoragePath, err)
+					}
+				}
+			}
+		}()
+	}
 
 	<-ctx.Done()
 
