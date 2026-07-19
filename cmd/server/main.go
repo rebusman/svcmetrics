@@ -77,6 +77,8 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
+	r.Use(handler.GzipRequestMiddleware)
+	r.Use(handler.GzipResponseMiddleware)
 	r.Use(loggingMiddleware(log))
 
 	r.Post("/update", handler.UpdateJSONHandler(s))
