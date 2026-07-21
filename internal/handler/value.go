@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -29,6 +32,56 @@ var listTmpl = template.Must(template.New("metrics").Parse(`
 </body>
 </html>`))
 
+// ValueJSONHandler handles POST /value.
+func ValueJSONHandler(s Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var m models.Metrics
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			if errors.Is(err, io.EOF) {
+				http.Error(w, "Empty body", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			}
+			return
+		}
+
+		if m.ID == "" {
+			http.Error(w, "Metric ID missing", http.StatusBadRequest)
+			return
+		}
+
+		var result models.Metrics
+		result.ID = m.ID
+		result.MType = m.MType
+
+		switch m.MType {
+		case models.Gauge:
+			val, err := s.GetGauge(m.ID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			result.Value = &val
+		case models.Counter:
+			val, err := s.GetCounter(m.ID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			result.Delta = &val
+		default:
+			http.Error(w, "Invalid metric type", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+	}
+}
+
 // ValueHandler handles GET /value/{type}/{name}.
 func ValueHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +105,7 @@ func ValueHandler(s Storage) http.HandlerFunc {
 			}
 			value = strconv.FormatInt(val, 10)
 		default:
-			http.Error(w, "Invalid metric type", http.StatusNotFound)
+			http.Error(w, "Invalid metric type", http.StatusBadRequest)
 			return
 		}
 

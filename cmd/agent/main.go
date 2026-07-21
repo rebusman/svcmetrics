@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"flag"
+	"log"
+	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,6 +19,26 @@ func main() {
 	reportInterval := flag.Int("r", 10, "report interval in seconds")
 	pollInterval := flag.Int("p", 2, "poll interval in seconds")
 	flag.Parse()
+
+	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
+		*addr = envAddr
+	}
+
+	if envReport := os.Getenv("REPORT_INTERVAL"); envReport != "" {
+		if v, err := strconv.Atoi(envReport); err == nil {
+			*reportInterval = v
+		} else {
+			log.Printf("Invalid REPORT_INTERVAL value: %s, using default\n", envReport)
+		}
+	}
+
+	if envPoll := os.Getenv("POLL_INTERVAL"); envPoll != "" {
+		if v, err := strconv.Atoi(envPoll); err == nil {
+			*pollInterval = v
+		} else {
+			log.Printf("Invalid POLL_INTERVAL value: %s, using default\n", envPoll)
+		}
+	}
 
 	endpoint := *addr
 	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {

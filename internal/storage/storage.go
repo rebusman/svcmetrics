@@ -1,8 +1,12 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"sync"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 type MemStorage struct {
@@ -68,4 +72,61 @@ func (s *MemStorage) GetAllCounters() map[string]int64 {
 		res[k] = v
 	}
 	return res
+}
+
+func (s *MemStorage) snapshot() []models.Metrics {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	metrics := make([]models.Metrics, 0, len(s.gauges)+len(s.counters))
+	for name, val := range s.gauges {
+		v := val
+		metrics = append(metrics, models.Metrics{ID: name, MType: models.Gauge, Value: &v})
+	}
+	for name, val := range s.counters {
+		d := val
+		metrics = append(metrics, models.Metrics{ID: name, MType: models.Counter, Delta: &d})
+	}
+	return metrics
+}
+
+func (s *MemStorage) Save(path string) error {
+	metrics := s.snapshot()
+
+	data, err := json.MarshalIndent(metrics, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+func (s *MemStorage) Load(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var metrics []models.Metrics
+	if err := json.Unmarshal(data, &metrics); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, m := range metrics {
+		switch m.MType {
+		case models.Gauge:
+			if m.Value != nil {
+				s.gauges[m.ID] = *m.Value
+			}
+		case models.Counter:
+			if m.Delta != nil {
+				s.counters[m.ID] = *m.Delta
+			}
+		}
+	}
+
+	return nil
 }

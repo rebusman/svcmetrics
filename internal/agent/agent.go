@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -199,12 +202,48 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 }
 
 func (a *Agent) sendMetric(metricType, name, value string) error {
-	url := fmt.Sprintf("%s/update/%s/%s/%s", a.endpoint, metricType, name, value)
-	req, err := http.NewRequest(http.MethodPost, url, http.NoBody)
+	m := models.Metrics{
+		ID:    name,
+		MType: metricType,
+	}
+
+	if metricType == models.Gauge {
+		val, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("parse gauge value %q: %w", value, err)
+		}
+		m.Value = &val
+	} else {
+		val, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse counter value %q: %w", value, err)
+		}
+		m.Delta = &val
+	}
+
+	body, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "text/plain")
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(body); err != nil {
+		_ = gw.Close()
+		return err
+	}
+	if err := gw.Close(); err != nil {
+		return err
+	}
+	body = buf.Bytes()
+
+	url := fmt.Sprintf("%s/update", a.endpoint)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
 
 	resp, err := a.client.Do(req)
 	if err != nil {
