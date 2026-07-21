@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"sync"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 type MemStorage struct {
@@ -76,20 +78,14 @@ func (s *MemStorage) Save(path string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var metrics []interface{}
+	metrics := make([]models.Metrics, 0, len(s.gauges)+len(s.counters))
 	for name, val := range s.gauges {
-		metrics = append(metrics, map[string]interface{}{
-			"id":    name,
-			"type":  "gauge",
-			"value": val,
-		})
+		v := val
+		metrics = append(metrics, models.Metrics{ID: name, MType: models.Gauge, Value: &v})
 	}
 	for name, val := range s.counters {
-		metrics = append(metrics, map[string]interface{}{
-			"id":    name,
-			"type":  "counter",
-			"delta": val,
-		})
+		d := val
+		metrics = append(metrics, models.Metrics{ID: name, MType: models.Counter, Delta: &d})
 	}
 
 	data, err := json.MarshalIndent(metrics, "", "  ")
@@ -106,34 +102,23 @@ func (s *MemStorage) Load(path string) error {
 		return err
 	}
 
-	var rawMetrics []json.RawMessage
-	if err := json.Unmarshal(data, &rawMetrics); err != nil {
+	var metrics []models.Metrics
+	if err := json.Unmarshal(data, &metrics); err != nil {
 		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, raw := range rawMetrics {
-		var m map[string]interface{}
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return err
-		}
-
-		id, okID := m["id"].(string)
-		mType, okType := m["type"].(string)
-		if !okID || !okType {
-			continue
-		}
-
-		switch mType {
-		case "gauge":
-			if val, ok := m["value"].(float64); ok {
-				s.gauges[id] = val
+	for _, m := range metrics {
+		switch m.MType {
+		case models.Gauge:
+			if m.Value != nil {
+				s.gauges[m.ID] = *m.Value
 			}
-		case "counter":
-			if val, ok := m["delta"].(float64); ok {
-				s.counters[id] = int64(val)
+		case models.Counter:
+			if m.Delta != nil {
+				s.counters[m.ID] = *m.Delta
 			}
 		}
 	}
