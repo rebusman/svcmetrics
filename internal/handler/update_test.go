@@ -271,4 +271,14 @@ func TestValueJSONHandler(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 		}
 	})
+
+	t.Run("empty body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader([]byte{}))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
 }

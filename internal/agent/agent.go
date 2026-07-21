@@ -208,10 +208,16 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 	}
 
 	if metricType == models.Gauge {
-		val, _ := strconv.ParseFloat(value, 64)
+		val, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("parse gauge value %q: %w", value, err)
+		}
 		m.Value = &val
 	} else {
-		val, _ := strconv.ParseInt(value, 10, 64)
+		val, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse counter value %q: %w", value, err)
+		}
 		m.Delta = &val
 	}
 

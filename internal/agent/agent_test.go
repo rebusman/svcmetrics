@@ -99,3 +99,24 @@ func TestSendMetrics(t *testing.T) {
 		}
 	}
 }
+
+func TestSendMetricInvalidValue(t *testing.T) {
+	a := New("http://example.com", 0, 0)
+
+	tests := []struct {
+		name       string
+		metricType string
+		value      string
+	}{
+		{name: "gauge", metricType: models.Gauge, value: "not-a-number"},
+		{name: "counter", metricType: models.Counter, value: "not-an-int"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := a.sendMetric(tt.metricType, "metric", tt.value); err == nil {
+				t.Fatalf("sendMetric() error = nil, want error")
+			}
+		})
+	}
+}

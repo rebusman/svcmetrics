@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -35,7 +37,11 @@ func ValueJSONHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			if errors.Is(err, io.EOF) {
+				http.Error(w, "Empty body", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			}
 			return
 		}
 
