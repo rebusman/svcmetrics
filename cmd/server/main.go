@@ -64,14 +64,21 @@ func main() {
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	flag.Parse()
 
+	log := logrus.New()
+	log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
 	}
 
 	if envStoreInterval := os.Getenv("STORE_INTERVAL"); envStoreInterval != "" {
-		if v, err := strconv.Atoi(envStoreInterval); err == nil {
-			*storeInterval = v
+		v, err := strconv.Atoi(envStoreInterval)
+		if err != nil {
+			log.Fatalf("Invalid STORE_INTERVAL value %q: %v", envStoreInterval, err)
 		}
+		*storeInterval = v
 	}
 
 	if envFileStoragePath := os.Getenv("FILE_STORAGE_PATH"); envFileStoragePath != "" {
@@ -79,15 +86,12 @@ func main() {
 	}
 
 	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
-		if v, err := strconv.ParseBool(envRestore); err == nil {
-			*restore = v
+		v, err := strconv.ParseBool(envRestore)
+		if err != nil {
+			log.Fatalf("Invalid RESTORE value %q: %v", envRestore, err)
 		}
+		*restore = v
 	}
-
-	log := logrus.New()
-	log.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp: true,
-	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
