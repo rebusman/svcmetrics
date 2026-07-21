@@ -35,6 +35,30 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
+// syncStorage decorates MemStorage to persist metrics to disk synchronously
+// after every write. It is used when STORE_INTERVAL == 0.
+type syncStorage struct {
+	*storage.MemStorage
+	path string
+	log  *logrus.Logger
+}
+
+func (s *syncStorage) save() {
+	if err := s.MemStorage.Save(s.path); err != nil {
+		s.log.Errorf("Failed to save metrics to %s: %v", s.path, err)
+	}
+}
+
+func (s *syncStorage) UpdateGauge(name string, value float64) {
+	s.MemStorage.UpdateGauge(name, value)
+	s.save()
+}
+
+func (s *syncStorage) UpdateCounter(name string, value int64) {
+	s.MemStorage.UpdateCounter(name, value)
+	s.save()
+}
+
 func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +129,14 @@ func main() {
 		}
 	}
 
+	// hs is the storage the handlers write through. With STORE_INTERVAL == 0
+	// every write is flushed to disk synchronously; otherwise a background
+	// ticker persists metrics periodically.
+	var hs handler.Storage = s
+	if *storeInterval == 0 {
+		hs = &syncStorage{MemStorage: s, path: *fileStoragePath, log: log}
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
@@ -112,11 +144,11 @@ func main() {
 	r.Use(handler.GzipResponseMiddleware)
 	r.Use(loggingMiddleware(log))
 
-	r.Post("/update", handler.UpdateJSONHandler(s))
-	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(s))
-	r.Get("/value/{type}/{name}", handler.ValueHandler(s))
-	r.Post("/value", handler.ValueJSONHandler(s))
-	r.Get("/", handler.ListHandler(s))
+	r.Post("/update", handler.UpdateJSONHandler(hs))
+	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(hs))
+	r.Get("/value/{type}/{name}", handler.ValueHandler(hs))
+	r.Post("/value", handler.ValueJSONHandler(hs))
+	r.Get("/", handler.ListHandler(hs))
 
 	srv := &http.Server{
 		Addr:              *addr,
