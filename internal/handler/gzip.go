@@ -36,7 +36,7 @@ func GzipResponseMiddleware(next http.Handler) http.Handler {
 			_ = gw.Close()
 		}()
 
-		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, writer: gw}, r)
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, writer: gw}, r)
 	})
 }
 
@@ -45,7 +45,7 @@ type gzipResponseWriter struct {
 	writer io.Writer
 }
 
-func (grw gzipResponseWriter) WriteHeader(code int) {
+func (grw *gzipResponseWriter) WriteHeader(code int) {
 	contentType := grw.ResponseWriter.Header().Get("Content-Type")
 	if (contentType == "application/json" || contentType == "text/html") && grw.ResponseWriter.Header().Get("Content-Encoding") == "" {
 		grw.ResponseWriter.Header().Set("Content-Encoding", "gzip")
@@ -53,7 +53,7 @@ func (grw gzipResponseWriter) WriteHeader(code int) {
 	grw.ResponseWriter.WriteHeader(code)
 }
 
-func (grw gzipResponseWriter) Write(b []byte) (int, error) {
+func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
 	contentType := grw.ResponseWriter.Header().Get("Content-Type")
 	if (contentType == "application/json" || contentType == "text/html") && grw.ResponseWriter.Header().Get("Content-Encoding") == "gzip" {
 		return grw.writer.Write(b)
