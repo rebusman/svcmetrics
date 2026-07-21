@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -32,7 +34,7 @@ func UpdateJSONHandler(s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				http.Error(w, "Empty body", http.StatusBadRequest)
 			} else {
 				http.Error(w, "Invalid JSON", http.StatusBadRequest)
