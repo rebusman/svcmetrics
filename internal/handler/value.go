@@ -70,7 +70,7 @@ func ValueJSONHandler(s Storage) http.HandlerFunc {
 			}
 			result.Delta = &val
 		default:
-			http.Error(w, "Invalid metric type", http.StatusNotFound)
+			http.Error(w, "Invalid metric type", http.StatusBadRequest)
 			return
 		}
 
@@ -105,7 +105,7 @@ func ValueHandler(s Storage) http.HandlerFunc {
 			}
 			value = strconv.FormatInt(val, 10)
 		default:
-			http.Error(w, "Invalid metric type", http.StatusNotFound)
+			http.Error(w, "Invalid metric type", http.StatusBadRequest)
 			return
 		}
 

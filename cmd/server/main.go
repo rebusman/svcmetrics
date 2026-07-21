@@ -139,6 +139,9 @@ func main() {
 			for {
 				select {
 				case <-ctx.Done():
+					if err := s.Save(*fileStoragePath); err != nil {
+						log.Errorf("Failed to save metrics to %s on shutdown: %v", *fileStoragePath, err)
+					}
 					return
 				case <-ticker.C:
 					if err := s.Save(*fileStoragePath); err != nil {

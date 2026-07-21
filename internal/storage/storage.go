@@ -74,7 +74,7 @@ func (s *MemStorage) GetAllCounters() map[string]int64 {
 	return res
 }
 
-func (s *MemStorage) Save(path string) error {
+func (s *MemStorage) snapshot() []models.Metrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -87,6 +87,11 @@ func (s *MemStorage) Save(path string) error {
 		d := val
 		metrics = append(metrics, models.Metrics{ID: name, MType: models.Counter, Delta: &d})
 	}
+	return metrics
+}
+
+func (s *MemStorage) Save(path string) error {
+	metrics := s.snapshot()
 
 	data, err := json.MarshalIndent(metrics, "", "  ")
 	if err != nil {

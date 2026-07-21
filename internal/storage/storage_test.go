@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,5 +69,29 @@ func TestMemStorageSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got, err := loaded.GetCounter("PollCount"); err != nil || got != 3 {
 		t.Fatalf("loaded counter = %d, err = %v, want 3, nil", got, err)
+	}
+}
+
+func TestMemStorageSaveLoadLargeCounter(t *testing.T) {
+	s := NewMemStorage()
+	const bigCounter = int64(math.MaxInt64 - 1)
+	s.UpdateCounter("PollCount", bigCounter)
+
+	path := filepath.Join(t.TempDir(), "metrics_large_counter.json")
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save error = %v", err)
+	}
+
+	loaded := NewMemStorage()
+	if err := loaded.Load(path); err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+
+	got, err := loaded.GetCounter("PollCount")
+	if err != nil {
+		t.Fatalf("GetCounter error = %v", err)
+	}
+	if got != bigCounter {
+		t.Fatalf("loaded large counter = %d, want %d", got, bigCounter)
 	}
 }

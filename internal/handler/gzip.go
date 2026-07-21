@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"bufio"
 	"compress/gzip"
+	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -31,6 +35,8 @@ func GzipResponseMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		w.Header().Add("Vary", "Accept-Encoding")
+
 		gw := gzip.NewWriter(w)
 		defer func() {
 			_ = gw.Close()
@@ -42,21 +48,65 @@ func GzipResponseMiddleware(next http.Handler) http.Handler {
 
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	writer io.Writer
+	writer *gzip.Writer
+}
+
+func isCompressibleContentType(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err == nil {
+		return mediaType == "application/json" || mediaType == "text/html"
+	}
+	return strings.HasPrefix(contentType, "application/json") || strings.HasPrefix(contentType, "text/html")
+}
+
+func (grw *gzipResponseWriter) enableCompressionIfNeeded() {
+	if isCompressibleContentType(grw.ResponseWriter.Header().Get("Content-Type")) && grw.ResponseWriter.Header().Get("Content-Encoding") == "" {
+		grw.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+		grw.ResponseWriter.Header().Del("Content-Length")
+	}
+}
+
+func (grw *gzipResponseWriter) shouldCompress() bool {
+	return isCompressibleContentType(grw.ResponseWriter.Header().Get("Content-Type")) && grw.ResponseWriter.Header().Get("Content-Encoding") == "gzip"
 }
 
 func (grw *gzipResponseWriter) WriteHeader(code int) {
-	contentType := grw.ResponseWriter.Header().Get("Content-Type")
-	if (contentType == "application/json" || contentType == "text/html") && grw.ResponseWriter.Header().Get("Content-Encoding") == "" {
-		grw.ResponseWriter.Header().Set("Content-Encoding", "gzip")
-	}
+	grw.enableCompressionIfNeeded()
 	grw.ResponseWriter.WriteHeader(code)
 }
 
 func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
-	contentType := grw.ResponseWriter.Header().Get("Content-Type")
-	if (contentType == "application/json" || contentType == "text/html") && grw.ResponseWriter.Header().Get("Content-Encoding") == "gzip" {
+	grw.enableCompressionIfNeeded()
+	if grw.shouldCompress() {
 		return grw.writer.Write(b)
 	}
 	return grw.ResponseWriter.Write(b)
+}
+
+func (grw *gzipResponseWriter) Flush() {
+	if grw.shouldCompress() {
+		_ = grw.writer.Flush()
+	}
+	if flusher, ok := grw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (grw *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := grw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (grw *gzipResponseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := grw.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
 }

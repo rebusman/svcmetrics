@@ -87,7 +87,7 @@ func TestValueHandler(t *testing.T) {
 		{"counter ok", "/value/counter/PollCount", http.StatusOK, "5"},
 		{"gauge not found", "/value/gauge/Unknown", http.StatusNotFound, ""},
 		{"counter not found", "/value/counter/Unknown", http.StatusNotFound, ""},
-		{"invalid type", "/value/unknown/Alloc", http.StatusNotFound, ""},
+		{"invalid type", "/value/unknown/Alloc", http.StatusBadRequest, ""},
 	}
 
 	for _, tt := range tests {
