@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"net/http"
@@ -11,8 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	"github.com/rebusman/svcmetrics/internal/storage"
 	"github.com/sirupsen/logrus"
@@ -44,7 +44,7 @@ type syncStorage struct {
 }
 
 func (s *syncStorage) save() {
-	if err := s.MemStorage.Save(s.path); err != nil {
+	if err := s.Save(s.path); err != nil {
 		s.log.Errorf("Failed to save metrics to %s: %v", s.path, err)
 	}
 }
@@ -86,6 +86,7 @@ func main() {
 	storeInterval := flag.Int("i", 300, "save interval in seconds")
 	fileStoragePath := flag.String("f", "metrics_storage.json", "path to storage file")
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
+	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
 	flag.Parse()
 
 	log := logrus.New()
@@ -117,6 +118,32 @@ func main() {
 		*restore = v
 	}
 
+	if envDatabaseDSN := os.Getenv("DATABASE_DSN"); envDatabaseDSN != "" {
+		*databaseDSN = envDatabaseDSN
+	}
+
+	var db *sql.DB
+	if *databaseDSN != "" {
+		var err error
+		db, err = sql.Open("pgx", *databaseDSN)
+		if err != nil {
+			log.Fatalf("Failed to open database connection: %v", err)
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				log.Errorf("Failed to close database connection: %v", err)
+			}
+		}()
+
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := db.PingContext(pingCtx); err != nil {
+			log.Errorf("Failed to ping database at startup: %v", err)
+		} else {
+			log.Info("Database connection established")
+		}
+		cancel()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -137,18 +164,12 @@ func main() {
 		hs = &syncStorage{MemStorage: s, path: *fileStoragePath, log: log}
 	}
 
-	r := chi.NewRouter()
-	r.Use(middleware.CleanPath)
-	r.Use(middleware.Recoverer)
-	r.Use(handler.GzipRequestMiddleware)
-	r.Use(handler.GzipResponseMiddleware)
-	r.Use(loggingMiddleware(log))
+	var pinger handler.Pinger
+	if db != nil {
+		pinger = db
+	}
 
-	r.Post("/update", handler.UpdateJSONHandler(hs))
-	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(hs))
-	r.Get("/value/{type}/{name}", handler.ValueHandler(hs))
-	r.Post("/value", handler.ValueJSONHandler(hs))
-	r.Get("/", handler.ListHandler(hs))
+	r := newRouter(log, hs, pinger)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -187,9 +208,9 @@ func main() {
 	<-ctx.Done()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatal(err)
+	err := srv.Shutdown(shutdownCtx)
+	cancel()
+	if err != nil {
+		log.Errorf("Server shutdown failed: %v", err)
 	}
 }

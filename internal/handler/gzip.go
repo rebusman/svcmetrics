@@ -37,18 +37,25 @@ func GzipResponseMiddleware(next http.Handler) http.Handler {
 
 		w.Header().Add("Vary", "Accept-Encoding")
 
-		gw := gzip.NewWriter(w)
+		grw := &gzipResponseWriter{ResponseWriter: w}
 		defer func() {
-			_ = gw.Close()
+			_ = grw.Close()
 		}()
 
-		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, writer: gw}, r)
+		next.ServeHTTP(grw, r)
 	})
 }
 
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	writer *gzip.Writer
+}
+
+func (grw *gzipResponseWriter) Close() error {
+	if grw.writer != nil {
+		return grw.writer.Close()
+	}
+	return nil
 }
 
 func isCompressibleContentType(contentType string) bool {
@@ -81,13 +88,16 @@ func (grw *gzipResponseWriter) WriteHeader(code int) {
 func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
 	grw.enableCompressionIfNeeded()
 	if grw.shouldCompress() {
+		if grw.writer == nil {
+			grw.writer = gzip.NewWriter(grw.ResponseWriter)
+		}
 		return grw.writer.Write(b)
 	}
 	return grw.ResponseWriter.Write(b)
 }
 
 func (grw *gzipResponseWriter) Flush() {
-	if grw.shouldCompress() {
+	if grw.shouldCompress() && grw.writer != nil {
 		_ = grw.writer.Flush()
 	}
 	if flusher, ok := grw.ResponseWriter.(http.Flusher); ok {
