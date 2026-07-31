@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"runtime"
@@ -240,8 +241,14 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 
 	var buf bytes.Buffer
 	gw := gzipWriterPool.Get().(*gzip.Writer)
-
-	defer gzipWriterPool.Put(gw)
+	defer func() {
+		// Point the writer away from this request's buffer before pooling it:
+		// a writer sitting in the pool would otherwise keep the payload (and
+		// its backing array) alive until the next Get. Reset also restores a
+		// writer left in a bad state by a failed compression.
+		gw.Reset(io.Discard)
+		gzipWriterPool.Put(gw)
+	}()
 	gw.Reset(&buf)
 
 	if _, err := gw.Write(body); err != nil {

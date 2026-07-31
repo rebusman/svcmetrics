@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +71,40 @@ func TestSendMetricReusesPooledGzipWriters(t *testing.T) {
 	}
 }
 
+// A writer resting in the pool must not point at the buffer it just compressed
+// into: it would pin that payload until the next Get.
+func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second)
+	if err := a.sendMetric(models.Gauge, "Alloc", "12.5"); err != nil {
+		t.Fatalf("sendMetric error = %v", err)
+	}
+
+	gw := gzipWriterPool.Get().(*gzip.Writer)
+	defer func() {
+		gw.Reset(io.Discard)
+		gzipWriterPool.Put(gw)
+	}()
+
+	// gzip.Writer keeps its destination in an unexported field, so this reads
+	// the type only. If the stdlib ever renames it, skip rather than fail.
+	dest := reflect.ValueOf(gw).Elem().FieldByName("w")
+	if !dest.IsValid() || dest.Kind() != reflect.Interface {
+		t.Skip("gzip.Writer has no inspectable destination field anymore")
+	}
+	if dest.IsNil() {
+		return // a freshly constructed writer from pool.New — nothing retained
+	}
+	if got := dest.Elem().Type().String(); strings.Contains(got, "bytes.Buffer") {
+		t.Fatalf("pooled writer still points at %s, retaining the request payload", got)
+	}
+}
+
 // These two isolate what the pool changes: BenchmarkSendMetric below is
 // dominated by the HTTP round trip, which hides the compressor's cost.
 var benchPayload = []byte(`{"id":"Alloc","type":"gauge","value":123456.789}`)
@@ -86,6 +121,7 @@ func BenchmarkGzipCompressPooled(b *testing.B) {
 		if err := gw.Close(); err != nil {
 			b.Fatal(err)
 		}
+		gw.Reset(io.Discard)
 		gzipWriterPool.Put(gw)
 		_ = buf.Bytes()
 	}

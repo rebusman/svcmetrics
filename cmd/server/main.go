@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,12 +43,21 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
-// Flush and Hijack keep working through the wrapper: chi's middleware and the
-// gzip writer below expect the optional interfaces to survive the decoration.
+// Flush and Hijack keep working through the wrapper: wrapping a ResponseWriter
+// hides whatever optional interfaces it implements, and the gzip writer below
+// expects both to survive the decoration.
 func (rw *responseWriter) Flush() {
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+	}
+	return hijacker.Hijack()
 }
 
 // syncStorage decorates MemStorage to persist metrics to disk synchronously
