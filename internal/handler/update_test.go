@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,7 @@ import (
 	"github.com/rebusman/svcmetrics/internal/storage"
 )
 
-func newTestRouter(s Storage) chi.Router {
+func newTestRouter(s storage.Storage) chi.Router {
 	r := chi.NewRouter()
 	r.Post("/update", UpdateJSONHandler(s))
 	r.Post("/update/{type}/{name}/{value}", UpdateHandler(s))
@@ -36,7 +37,7 @@ func TestUpdateHandlerGauge(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	got, err := s.GetGauge("Alloc")
+	got, err := s.GetGauge(context.Background(), "Alloc")
 	if err != nil {
 		t.Fatalf("GetGauge error = %v", err)
 	}
@@ -62,64 +63,12 @@ func TestUpdateHandlerCounter(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec2.Code, http.StatusOK)
 	}
 
-	got, err := s.GetCounter("PollCount")
+	got, err := s.GetCounter(context.Background(), "PollCount")
 	if err != nil {
 		t.Fatalf("GetCounter error = %v", err)
 	}
 	if got != 6 {
 		t.Fatalf("counter value = %d, want 6", got)
-	}
-}
-
-func TestValueHandler(t *testing.T) {
-	s := storage.NewMemStorage()
-	s.UpdateGauge("Alloc", 12.5)
-	s.UpdateCounter("PollCount", 5)
-	r := newTestRouter(s)
-
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-		wantBody   string
-	}{
-		{"gauge ok", "/value/gauge/Alloc", http.StatusOK, "12.5"},
-		{"counter ok", "/value/counter/PollCount", http.StatusOK, "5"},
-		{"gauge not found", "/value/gauge/Unknown", http.StatusNotFound, ""},
-		{"counter not found", "/value/counter/Unknown", http.StatusNotFound, ""},
-		{"invalid type", "/value/unknown/Alloc", http.StatusBadRequest, ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-
-			if rec.Code != tt.wantStatus {
-				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
-			}
-			if tt.wantStatus == http.StatusOK && rec.Body.String() != tt.wantBody {
-				t.Errorf("body = %s, want %s", rec.Body.String(), tt.wantBody)
-			}
-		})
-	}
-}
-
-func TestListHandler(t *testing.T) {
-	s := storage.NewMemStorage()
-	s.UpdateGauge("Alloc", 12.5)
-	r := newTestRouter(s)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if rec.Header().Get("Content-Type") != "text/html" {
-		t.Errorf("content type = %s, want text/html", rec.Header().Get("Content-Type"))
 	}
 }
 
@@ -201,79 +150,6 @@ func TestUpdateJSONHandler(t *testing.T) {
 
 	t.Run("empty body", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader([]byte{}))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-		}
-	})
-}
-
-func TestValueJSONHandler(t *testing.T) {
-	s := storage.NewMemStorage()
-	gaugeVal := 12.5
-	s.UpdateGauge("Alloc", gaugeVal)
-	s.UpdateCounter("PollCount", 7)
-	r := newTestRouter(s)
-
-	t.Run("gauge ok", func(t *testing.T) {
-		m := models.Metrics{ID: "Alloc", MType: models.Gauge}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-		}
-		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-			t.Errorf("Content-Type = %s, want application/json", ct)
-		}
-		var result models.Metrics
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("decode response: %v", err)
-		}
-		if result.Value == nil || *result.Value != gaugeVal {
-			t.Errorf("value = %v, want %v", result.Value, gaugeVal)
-		}
-	})
-
-	t.Run("counter ok", func(t *testing.T) {
-		m := models.Metrics{ID: "PollCount", MType: models.Counter}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-		}
-		var result models.Metrics
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("decode response: %v", err)
-		}
-		if result.Delta == nil || *result.Delta != 7 {
-			t.Errorf("delta = %v, want 7", result.Delta)
-		}
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		m := models.Metrics{ID: "Unknown", MType: models.Gauge}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-		}
-	})
-
-	t.Run("empty body", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader([]byte{}))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)

@@ -4,10 +4,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rebusman/svcmetrics/internal/handler"
+	"github.com/rebusman/svcmetrics/internal/storage"
 	"github.com/sirupsen/logrus"
 )
 
-func newRouter(log *logrus.Logger, hs handler.Storage, pinger handler.Pinger) chi.Router {
+func newRouter(log *logrus.Logger, hs storage.Storage, pinger handler.Pinger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)

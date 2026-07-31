@@ -29,6 +29,12 @@ const (
 	reportRetryInterval = 1 * time.Second
 )
 
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		return gzip.NewWriter(nil)
+	},
+}
+
 type metricState struct {
 	gauges   map[string]float64
 	counters map[string]int64
@@ -207,18 +213,24 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 		MType: metricType,
 	}
 
-	if metricType == models.Gauge {
+	// Only the two known types are accepted: falling through to the counter
+	// branch would silently ship a mistyped metric that the server then
+	// rejects, with nothing pointing back at the caller.
+	switch metricType {
+	case models.Gauge:
 		val, err := strconv.ParseFloat(value, 64)
 		if err != nil {
 			return fmt.Errorf("parse gauge value %q: %w", value, err)
 		}
 		m.Value = &val
-	} else {
+	case models.Counter:
 		val, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return fmt.Errorf("parse counter value %q: %w", value, err)
 		}
 		m.Delta = &val
+	default:
+		return fmt.Errorf("unsupported metric type %q for metric %q", metricType, name)
 	}
 
 	body, err := json.Marshal(m)
@@ -227,11 +239,15 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 	}
 
 	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
+	gw := gzipWriterPool.Get().(*gzip.Writer)
+
+	defer gzipWriterPool.Put(gw)
+	gw.Reset(&buf)
+
 	if _, err := gw.Write(body); err != nil {
-		_ = gw.Close()
 		return err
 	}
+	// Close flushes the gzip trailer; the buffer is only complete afterwards.
 	if err := gw.Close(); err != nil {
 		return err
 	}

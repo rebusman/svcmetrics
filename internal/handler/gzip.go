@@ -3,13 +3,30 @@ package handler
 import (
 	"bufio"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
+
+type gzipRequestBody struct {
+	*gzip.Reader
+	orig io.Closer
+
+	once sync.Once
+	err  error
+}
+
+func (b *gzipRequestBody) Close() error {
+	b.once.Do(func() {
+		b.err = errors.Join(b.Reader.Close(), b.orig.Close())
+	})
+	return b.err
+}
 
 func GzipRequestMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -19,10 +36,15 @@ func GzipRequestMiddleware(next http.Handler) http.Handler {
 				http.Error(w, "Invalid gzip content", http.StatusBadRequest)
 				return
 			}
+
+			body := &gzipRequestBody{Reader: gz, orig: r.Body}
+			// net/http closes the body it captured before the handler ran, not
+			// the replacement, so without this the decompressor would never be
+			// closed at all. Close being idempotent keeps that safe.
 			defer func() {
-				_ = gz.Close()
+				_ = body.Close()
 			}()
-			r.Body = io.NopCloser(gz)
+			r.Body = body
 		}
 		next.ServeHTTP(w, r)
 	})
