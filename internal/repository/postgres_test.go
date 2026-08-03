@@ -1,3 +1,7 @@
+//go:build integration
+
+// The tests in this file need Docker: they run PostgreSQL in a throwaway
+// container through testcontainers. Run them with -tags integration.
 package repository
 
 import (
@@ -505,5 +509,58 @@ func TestPgStorageConcurrentBatchesDoNotDeadlock(t *testing.T) {
 		if got != want {
 			t.Fatalf("counter %q = %d, want %d", name, got, want)
 		}
+	}
+}
+
+// TestPgStorageCounterTreatsNullDeltaAsZero verifies that a counter row left
+// with a NULL delta does not poison the accumulation: NULL + delta would be
+// NULL and stop the counter from ever growing again.
+func TestPgStorageCounterTreatsNullDeltaAsZero(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	name := t.Name()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO metrics (id, mtype, delta) VALUES ($1, $2, NULL)`, name, models.Counter)
+	if err != nil {
+		t.Fatalf("seed NULL delta error = %v", err)
+	}
+
+	got, err := s.UpdateCounter(ctx, name, 5)
+	if err != nil {
+		t.Fatalf("UpdateCounter error = %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("UpdateCounter returned %d, want 5", got)
+	}
+
+	stored, err := s.GetCounter(ctx, name)
+	if err != nil || stored != 5 {
+		t.Fatalf("counter = %d (err %v), want 5", stored, err)
+	}
+}
+
+// TestPgStorageUpdateBatchTreatsNullDeltaAsZero covers the same NULL delta on
+// the batch path.
+func TestPgStorageUpdateBatchTreatsNullDeltaAsZero(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	name := t.Name()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO metrics (id, mtype, delta) VALUES ($1, $2, NULL)`, name, models.Counter)
+	if err != nil {
+		t.Fatalf("seed NULL delta error = %v", err)
+	}
+
+	if err := s.UpdateBatch(ctx, []models.Metrics{counter(name, 3), counter(name, 4)}); err != nil {
+		t.Fatalf("UpdateBatch error = %v", err)
+	}
+
+	stored, err := s.GetCounter(ctx, name)
+	if err != nil || stored != 7 {
+		t.Fatalf("counter = %d (err %v), want 7", stored, err)
 	}
 }

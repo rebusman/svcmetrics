@@ -8,6 +8,8 @@ import (
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
+//go:generate go tool mockgen -destination=../mocks/repository.go -package=mocks github.com/rebusman/svcmetrics/internal/repository Storage,Reader,Writer
+
 // Reader describes read access to the metric storage.
 type Reader interface {
 	GetGauge(ctx context.Context, name string) (float64, error)

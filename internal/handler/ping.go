@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+//go:generate go tool mockgen -destination=../mocks/pinger.go -package=mocks github.com/rebusman/svcmetrics/internal/handler Pinger
+
 // Pinger reports whether the backing database is reachable. Only the
 // PostgreSQL storage implements it.
 type Pinger interface {

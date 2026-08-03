@@ -41,6 +41,8 @@ type hijackableRecorder struct {
 	hijackErr error
 	hijacked  bool
 	flushed   bool
+	pushed    string
+	pushErr   error
 }
 
 func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -54,6 +56,11 @@ func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (h *hijackableRecorder) Flush() {
 	h.flushed = true
 	h.ResponseRecorder.Flush()
+}
+
+func (h *hijackableRecorder) Push(target string, _ *http.PushOptions) error {
+	h.pushed = target
+	return h.pushErr
 }
 
 // TestResponseWriterForwardsOptionalInterfaces verifies that the wrapper
@@ -73,6 +80,16 @@ func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	if _, ok := any(rw).(http.Hijacker); !ok {
 		t.Fatal("responseWriter does not implement http.Hijacker")
 	}
+	if _, ok := any(rw).(http.Pusher); !ok {
+		t.Fatal("responseWriter does not implement http.Pusher")
+	}
+
+	if err := rw.Push("/asset.js", nil); err != nil {
+		t.Fatalf("Push error = %v", err)
+	}
+	if inner.pushed != "/asset.js" {
+		t.Errorf("Push reached the underlying ResponseWriter with %q, want /asset.js", inner.pushed)
+	}
 
 	rw.Flush()
 	if !inner.flushed {
@@ -91,6 +108,28 @@ func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	}
 	if brw == nil {
 		t.Error("Hijack returned a nil ReadWriter")
+	}
+}
+
+// TestResponseWriterPushPropagatesError verifies that a push failing downstream
+// surfaces unchanged rather than being reported as unsupported.
+func TestResponseWriterPushPropagatesError(t *testing.T) {
+	wantErr := errors.New("stream closed")
+	inner := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), pushErr: wantErr}
+	rw := &responseWriter{ResponseWriter: inner, statusCode: http.StatusOK}
+
+	if err := rw.Push("/asset.js", nil); !errors.Is(err, wantErr) {
+		t.Fatalf("Push error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestResponseWriterPushWithoutSupport verifies that a writer that cannot push
+// is reported as such instead of panicking on the type assertion.
+func TestResponseWriterPushWithoutSupport(t *testing.T) {
+	rw := &responseWriter{ResponseWriter: httptest.NewRecorder(), statusCode: http.StatusOK}
+
+	if err := rw.Push("/asset.js", nil); !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("Push error = %v, want %v", err, http.ErrNotSupported)
 	}
 }
 

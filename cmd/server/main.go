@@ -70,6 +70,16 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return hijacker.Hijack()
 }
 
+// Push forwards to the underlying ResponseWriter, keeping the optional
+// interface available through the wrapper.
+func (rw *responseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := rw.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
+}
+
 // syncStorage decorates MemStorage to persist the metrics to disk synchronously
 // after every write. It is used when STORE_INTERVAL is 0.
 type syncStorage struct {

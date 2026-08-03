@@ -53,13 +53,15 @@ func (s *PgStorage) UpdateGauge(ctx context.Context, name string, value float64)
 	return stored, nil
 }
 
-// UpdateCounter adds value to the counter and returns the running total.
+// UpdateCounter adds value to the counter and returns the running total. The
+// schema allows a NULL delta, which is counted as 0: without that a single NULL
+// row would turn every later sum into NULL and stop the accumulation.
 func (s *PgStorage) UpdateCounter(ctx context.Context, name string, value int64) (int64, error) {
 	var stored int64
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO metrics (id, mtype, delta)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (id, mtype) DO UPDATE SET delta = metrics.delta + EXCLUDED.delta
+		ON CONFLICT (id, mtype) DO UPDATE SET delta = COALESCE(metrics.delta, 0) + EXCLUDED.delta
 		RETURNING delta`,
 		name, models.Counter, value).Scan(&stored)
 	if err != nil {
@@ -104,7 +106,7 @@ func (s *PgStorage) UpdateBatch(ctx context.Context, metrics []models.Metrics) e
 	counterStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO metrics (id, mtype, delta)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (id, mtype) DO UPDATE SET delta = metrics.delta + EXCLUDED.delta`)
+		ON CONFLICT (id, mtype) DO UPDATE SET delta = COALESCE(metrics.delta, 0) + EXCLUDED.delta`)
 	if err != nil {
 		return fmt.Errorf("prepare counter upsert: %w", err)
 	}
