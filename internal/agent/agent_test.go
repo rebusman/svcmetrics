@@ -3,11 +3,11 @@ package agent
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,44 +17,57 @@ import (
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
-// The server must still receive valid gzip after the writer has been recycled
-// through the pool many times — a Reset that misses would corrupt the stream.
-func TestSendMetricReusesPooledGzipWriters(t *testing.T) {
+// readBatch decompresses a request body and decodes the batch it carries.
+func readBatch(t *testing.T, r *http.Request) []models.Metrics {
+	t.Helper()
+
+	if got := r.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want gzip", got)
+	}
+	zr, err := gzip.NewReader(r.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader error = %v", err)
+	}
+	defer func() { _ = zr.Close() }()
+
+	var batch []models.Metrics
+	if err := json.NewDecoder(zr).Decode(&batch); err != nil {
+		t.Fatalf("decode batch error = %v", err)
+	}
+	return batch
+}
+
+func gaugeMetric(name string, value float64) models.Metrics {
+	return models.Metrics{ID: name, MType: models.Gauge, Value: &value}
+}
+
+func counterMetric(name string, delta int64) models.Metrics {
+	return models.Metrics{ID: name, MType: models.Counter, Delta: &delta}
+}
+
+// TestSendBatchReusesPooledGzipWriters verifies that the server still receives
+// valid gzip after the writer has been recycled through the pool many times: a
+// Reset that misses would corrupt the stream.
+func TestSendBatchReusesPooledGzipWriters(t *testing.T) {
 	const requests = 50
 
 	var (
 		mu      sync.Mutex
-		decoded []string
+		decoded [][]models.Metrics
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Content-Encoding"); got != "gzip" {
-			t.Errorf("Content-Encoding = %q, want gzip", got)
-		}
-		zr, err := gzip.NewReader(r.Body)
-		if err != nil {
-			t.Errorf("gzip.NewReader error = %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		defer func() { _ = zr.Close() }()
-
-		body, err := io.ReadAll(zr)
-		if err != nil {
-			t.Errorf("read decompressed body error = %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
+		batch := readBatch(t, r)
 		mu.Lock()
-		decoded = append(decoded, string(body))
+		decoded = append(decoded, batch)
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second)
+	a := New(srv.URL, time.Second, time.Second, 0)
 	for i := range requests {
-		if err := a.sendMetric(models.Gauge, "Alloc", strconv.Itoa(i)+".5"); err != nil {
-			t.Fatalf("sendMetric %d error = %v", i, err)
+		if err := a.sendBatch([]models.Metrics{gaugeMetric("Alloc", float64(i)+0.5)}); err != nil {
+			t.Fatalf("sendBatch %d error = %v", i, err)
 		}
 	}
 
@@ -63,16 +76,19 @@ func TestSendMetricReusesPooledGzipWriters(t *testing.T) {
 	if len(decoded) != requests {
 		t.Fatalf("server received %d bodies, want %d", len(decoded), requests)
 	}
-	for i, body := range decoded {
-		want := `"value":` + strconv.Itoa(i) + `.5`
-		if !strings.Contains(body, want) {
-			t.Errorf("body %d = %s, want it to contain %s", i, body, want)
+	for i, batch := range decoded {
+		if len(batch) != 1 {
+			t.Fatalf("batch %d has %d metrics, want 1", i, len(batch))
+		}
+		if batch[0].Value == nil || *batch[0].Value != float64(i)+0.5 {
+			t.Errorf("batch %d value = %v, want %v", i, batch[0].Value, float64(i)+0.5)
 		}
 	}
 }
 
-// A writer resting in the pool must not point at the buffer it just compressed
-// into: it would pin that payload until the next Get.
+// TestPooledGzipWriterDoesNotRetainRequestBuffer verifies that a writer resting
+// in the pool does not point at the buffer it just compressed into, which would
+// pin that payload until the next Get.
 func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -80,9 +96,9 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second)
-	if err := a.sendMetric(models.Gauge, "Alloc", "12.5"); err != nil {
-		t.Fatalf("sendMetric error = %v", err)
+	a := New(srv.URL, time.Second, time.Second, 0)
+	if err := a.sendBatch([]models.Metrics{gaugeMetric("Alloc", 12.5)}); err != nil {
+		t.Fatalf("sendBatch error = %v", err)
 	}
 
 	gw := gzipWriterPool.Get().(*gzip.Writer)
@@ -91,23 +107,22 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 		gzipWriterPool.Put(gw)
 	}()
 
-	// gzip.Writer keeps its destination in an unexported field, so this reads
-	// the type only. If the stdlib ever renames it, skip rather than fail.
 	dest := reflect.ValueOf(gw).Elem().FieldByName("w")
 	if !dest.IsValid() || dest.Kind() != reflect.Interface {
 		t.Skip("gzip.Writer has no inspectable destination field anymore")
 	}
 	if dest.IsNil() {
-		return // a freshly constructed writer from pool.New — nothing retained
+		return
 	}
 	if got := dest.Elem().Type().String(); strings.Contains(got, "bytes.Buffer") {
 		t.Fatalf("pooled writer still points at %s, retaining the request payload", got)
 	}
 }
 
-// These two isolate what the pool changes: BenchmarkSendMetric below is
-// dominated by the HTTP round trip, which hides the compressor's cost.
-var benchPayload = []byte(`{"id":"Alloc","type":"gauge","value":123456.789}`)
+// benchPayload is the body used by the compression benchmarks, which isolate
+// what the pool changes: BenchmarkSendBatch is dominated by the HTTP round trip
+// and hides the compressor's cost.
+var benchPayload = []byte(`[{"id":"Alloc","type":"gauge","value":123456.789}]`)
 
 func BenchmarkGzipCompressPooled(b *testing.B) {
 	b.ReportAllocs()
@@ -142,26 +157,28 @@ func BenchmarkGzipCompressFresh(b *testing.B) {
 	}
 }
 
-// Run with -benchmem to see the allocation difference the pool buys.
-func BenchmarkSendMetric(b *testing.B) {
+// BenchmarkSendBatch measures one batch round trip. Run it with -benchmem to
+// see the allocation difference the pool buys.
+func BenchmarkSendBatch(b *testing.B) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second)
+	a := New(srv.URL, time.Second, time.Second, 0)
+	batch := []models.Metrics{gaugeMetric("Alloc", 12.5)}
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := a.sendMetric(models.Gauge, "Alloc", "12.5"); err != nil {
-			b.Fatalf("sendMetric error = %v", err)
+		if err := a.sendBatch(batch); err != nil {
+			b.Fatalf("sendBatch error = %v", err)
 		}
 	}
 }
 
 func TestCollectRuntimeMetrics(t *testing.T) {
-	a := New("", 0, 0)
+	a := New("", 0, 0, 0)
 
 	a.CollectRuntimeMetrics()
 	a.CollectRuntimeMetrics()
@@ -182,136 +199,249 @@ func TestCollectRuntimeMetrics(t *testing.T) {
 	}
 }
 
-func TestSendMetrics(t *testing.T) {
-	var (
-		mu       sync.Mutex
-		recorded []string
-		statuses = make(map[string]int)
-	)
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read body: %v", err)
-		}
-		_ = r.Body.Close()
-
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Errorf("Content-Type = %q, want application/json", got)
-		}
-		if len(body) == 0 {
-			t.Errorf("body should not be empty")
-		}
-
-		mu.Lock()
-		recorded = append(recorded, r.URL.Path)
-		statuses[r.URL.Path]++
-		mu.Unlock()
-
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	a := New(ts.URL, 2*time.Second, 10*time.Second)
-	a.client = ts.Client()
-
+// seed fills the agent with one known value per collected metric.
+func seed(a *Agent) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	a.metrics.gauges = make(map[string]float64, len(models.GaugeMetricNames))
 	for _, name := range models.GaugeMetricNames {
 		a.metrics.gauges[name] = 0
 	}
 	a.metrics.gauges["Alloc"] = 1.5
 	a.metrics.gauges["RandomValue"] = 0.75
-	a.metrics.counters = map[string]int64{"PollCount": 7}
-	a.lastSentCounters = map[string]int64{"PollCount": 2}
-	a.mu.Unlock()
+	a.metrics.counters = map[string]int64{models.PollCount: 7}
+	a.lastSentCounters = map[string]int64{models.PollCount: 2}
+}
+
+func TestSendMetricsUsesBatches(t *testing.T) {
+	const batchSize = 10
+
+	var (
+		mu       sync.Mutex
+		paths    []string
+		received []models.Metrics
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+
+		batch := readBatch(t, r)
+		if len(batch) == 0 {
+			t.Error("empty batch must never be sent")
+		}
+		if len(batch) > batchSize {
+			t.Errorf("batch of %d metrics exceeds the configured size %d", len(batch), batchSize)
+		}
+
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		received = append(received, batch...)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	a := New(ts.URL, 2*time.Second, 10*time.Second, batchSize)
+	a.client = ts.Client()
+	seed(a)
 
 	if err := a.SendMetrics(); err != nil {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
-	expectedCount := len(models.GaugeMetricNames) + len(models.CounterMetricNames)
-
 	mu.Lock()
 	defer mu.Unlock()
 
-	if len(recorded) != expectedCount {
-		t.Fatalf("requests count = %d, want %d", len(recorded), expectedCount)
+	wantMetrics := len(models.GaugeMetricNames) + 1
+	wantRequests := (wantMetrics + batchSize - 1) / batchSize
+
+	if len(paths) != wantRequests {
+		t.Fatalf("requests count = %d, want %d", len(paths), wantRequests)
+	}
+	for _, path := range paths {
+		if path != "/updates/" {
+			t.Errorf("path = %q, want /updates/", path)
+		}
+	}
+	if len(received) != wantMetrics {
+		t.Fatalf("metrics sent = %d, want %d", len(received), wantMetrics)
 	}
 
-	for _, path := range recorded {
-		if path != "/update" {
-			t.Errorf("path = %q, want /update", path)
+	byID := make(map[string]models.Metrics, len(received))
+	for _, m := range received {
+		byID[m.ID] = m
+	}
+	if got := byID["Alloc"]; got.Value == nil || *got.Value != 1.5 {
+		t.Errorf("Alloc = %v, want 1.5", got.Value)
+	}
+	if got := byID[models.PollCount]; got.Delta == nil || *got.Delta != 5 {
+		t.Errorf("PollCount delta = %v, want 5", got.Delta)
+	}
+}
+
+// TestSendMetricsSkipsEmptyBatch verifies that a freshly started agent, which
+// has nothing to report, sends no request at all.
+func TestSendMetricsSkipsEmptyBatch(t *testing.T) {
+	var requests atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	a := New(ts.URL, time.Second, time.Second, 0)
+	a.client = ts.Client()
+
+	if err := a.SendMetrics(); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("server received %d requests, want 0", got)
+	}
+}
+
+// TestSendMetricsReturnsCounterDeltaOnFailure verifies that a report the server
+// rejected does not consume the counter delta: the next report carries it
+// again.
+func TestSendMetricsReturnsCounterDeltaOnFailure(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		deltas []int64
+		fail   = true
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		batch := readBatch(t, r)
+
+		mu.Lock()
+		for _, m := range batch {
+			if m.MType == models.Counter && m.Delta != nil {
+				deltas = append(deltas, *m.Delta)
+			}
+		}
+		shouldFail := fail
+		mu.Unlock()
+
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	a := New(ts.URL, time.Second, time.Second, 0)
+	a.client = ts.Client()
+	seed(a)
+
+	if err := a.SendMetrics(); err == nil {
+		t.Fatal("SendMetrics() error = nil, want a failure")
+	}
+
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+
+	if err := a.SendMetrics(); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deltas) != 2 {
+		t.Fatalf("counter deltas seen = %v, want two reports", deltas)
+	}
+	for i, got := range deltas {
+		if got != 5 {
+			t.Errorf("delta %d = %d, want 5 — a rejected batch must not be lost", i, got)
 		}
 	}
 }
 
-func TestSendMetricInvalidValue(t *testing.T) {
-	a := New("http://example.com", 0, 0)
+// TestSendBatchesReturnsOnlyUnsentMetrics verifies that only the chunk that
+// failed and everything after it is offered for a retry, so whatever the server
+// already accepted is never sent twice.
+func TestSendBatchesReturnsOnlyUnsentMetrics(t *testing.T) {
+	var requests atomic.Int64
 
-	tests := []struct {
-		name       string
-		metricType string
-		value      string
-	}{
-		{name: "gauge", metricType: models.Gauge, value: "not-a-number"},
-		{name: "counter", metricType: models.Counter, value: "not-an-int"},
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	a := New(ts.URL, time.Second, time.Second, 2)
+	a.client = ts.Client()
+
+	batch := []models.Metrics{
+		gaugeMetric("Alloc", 1),
+		gaugeMetric("Sys", 2),
+		gaugeMetric("HeapSys", 3),
+		counterMetric(models.PollCount, 4),
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := a.sendMetric(tt.metricType, "metric", tt.value); err == nil {
-				t.Fatalf("sendMetric() error = nil, want error")
-			}
-		})
+	unsent, err := a.sendBatches(batch)
+	if err == nil {
+		t.Fatal("sendBatches() error = nil, want a failure")
+	}
+	if len(unsent) != 2 {
+		t.Fatalf("unsent = %d metrics, want the two that were rejected", len(unsent))
+	}
+	if unsent[0].ID != "HeapSys" || unsent[1].ID != models.PollCount {
+		t.Errorf("unsent = %v, want HeapSys and PollCount", unsent)
 	}
 }
 
-// An unknown type must fail before anything is sent, rather than being
-// serialized as a counter and rejected by the server.
-func TestSendMetricRejectsUnknownType(t *testing.T) {
+func TestSendBatchSkipsEmptyPayload(t *testing.T) {
 	var requests atomic.Int64
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
+	defer ts.Close()
 
-	a := New(srv.URL, time.Second, time.Second)
+	a := New(ts.URL, time.Second, time.Second, 0)
+	a.client = ts.Client()
 
+	if err := a.sendBatch(nil); err != nil {
+		t.Fatalf("sendBatch(nil) error = %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("server received %d requests, want 0", got)
+	}
+}
+
+// TestNewBatchSize verifies that New honours the configured batch size and
+// falls back to the default only for a non-positive value.
+func TestNewBatchSize(t *testing.T) {
 	tests := []struct {
-		name       string
-		metricType string
-		value      string
+		name string
+		size int
+		want int
 	}{
-		{name: "unknown type", metricType: "histogram", value: "1"},
-		{name: "empty type", metricType: "", value: "1"},
-		{name: "wrong case", metricType: "Gauge", value: "1.5"},
-		{name: "value parseable as int", metricType: "summary", value: "42"},
+		{name: "configured", size: 5, want: 5},
+		{name: "zero falls back", size: 0, want: DefaultBatchSize},
+		{name: "negative falls back", size: -3, want: DefaultBatchSize},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := a.sendMetric(tt.metricType, "SomeMetric", tt.value)
-			if err == nil {
-				t.Fatalf("sendMetric(%q) error = nil, want error", tt.metricType)
-			}
-			// The message has to name the offending type, otherwise the caller
-			// cannot tell which metric was misconfigured.
-			if !strings.Contains(err.Error(), tt.metricType) && tt.metricType != "" {
-				t.Errorf("error %q does not mention the type %q", err, tt.metricType)
-			}
-			if !strings.Contains(err.Error(), "SomeMetric") {
-				t.Errorf("error %q does not mention the metric name", err)
+			if got := New("", 0, 0, tt.size).batchSize; got != tt.want {
+				t.Fatalf("batchSize = %d, want %d", got, tt.want)
 			}
 		})
-	}
-
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("server received %d requests, want 0 — nothing may be sent for an unsupported type", got)
 	}
 }

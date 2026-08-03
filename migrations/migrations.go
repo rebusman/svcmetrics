@@ -10,9 +10,13 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
+// embedFS holds the SQL migration files compiled into the binary.
+//
 //go:embed *.sql
 var embedFS embed.FS
 
+// Up applies every pending migration to db. It is safe to call on an
+// already-migrated database.
 func Up(ctx context.Context, db *sql.DB) error {
 	goose.SetBaseFS(embedFS)
 	if err := goose.SetDialect(string(goose.DialectPostgres)); err != nil {

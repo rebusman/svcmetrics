@@ -1,4 +1,4 @@
-package storage
+package repository
 
 import (
 	"context"
@@ -93,14 +93,14 @@ func TestPgStorageAppliesMigrationsAndPings(t *testing.T) {
 		t.Fatalf("PingContext error = %v", err)
 	}
 
-	// The metrics table exists only if the goose migration ran.
 	if _, err := s.UpdateGauge(ctx, t.Name(), 1); err != nil {
 		t.Fatalf("UpdateGauge on the migrated schema error = %v", err)
 	}
 }
 
-// A second NewPgStorage against the same database must not fail on migrations
-// that are already applied — that is what a server restart does.
+// TestPgStorageMigrationsAreIdempotent verifies that a second NewPgStorage
+// against the same database does not fail on migrations that are already
+// applied, which is what a server restart does.
 func TestPgStorageMigrationsAreIdempotent(t *testing.T) {
 	first := newTestPgStorage(t)
 
@@ -189,8 +189,8 @@ func TestPgStorageMissingMetricsReportNotFound(t *testing.T) {
 	}
 }
 
-// The primary key is (id, mtype), so the same name used as a gauge and as a
-// counter must stay two independent rows.
+// TestPgStorageSeparatesTypesWithTheSameName verifies that the (id, mtype)
+// primary key keeps a gauge and a counter of the same name in two rows.
 func TestPgStorageSeparatesTypesWithTheSameName(t *testing.T) {
 	s := newTestPgStorage(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -217,8 +217,9 @@ func TestPgStorageSeparatesTypesWithTheSameName(t *testing.T) {
 	}
 }
 
-// GetAll* must return only rows of the matching type; the table also holds
-// whatever the other tests wrote, so this checks its own keys.
+// TestPgStorageGetAll verifies that the readers return only rows of the
+// matching type. The table also holds what the other tests wrote, so the test
+// checks its own keys.
 func TestPgStorageGetAll(t *testing.T) {
 	s := newTestPgStorage(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -306,7 +307,8 @@ func TestPgStorageConcurrentCounterUpdatesAreAtomic(t *testing.T) {
 	}
 }
 
-// A cancelled request context must surface as an error rather than a zero value.
+// TestPgStorageHonoursContextCancellation verifies that a cancelled request
+// context surfaces as an error rather than a zero value.
 func TestPgStorageHonoursContextCancellation(t *testing.T) {
 	s := newTestPgStorage(t)
 
@@ -344,7 +346,8 @@ func TestPgStorageFailsAfterClose(t *testing.T) {
 	}
 }
 
-// Does not need Docker: nothing is listening on that port.
+// TestNewPgStorageRejectsUnreachableDSN does not need Docker: nothing is
+// listening on that port.
 func TestNewPgStorageRejectsUnreachableDSN(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -364,5 +367,143 @@ func TestNewPgStorageRejectsMalformedDSN(t *testing.T) {
 	if err == nil {
 		s.Close()
 		t.Fatal("NewPgStorage with a malformed DSN returned nil error")
+	}
+}
+
+func TestPgStorageUpdateBatch(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	gaugeName := t.Name() + "-gauge"
+	counterName := t.Name() + "-counter"
+
+	if _, err := s.UpdateCounter(ctx, counterName, 4); err != nil {
+		t.Fatalf("UpdateCounter error = %v", err)
+	}
+
+	err := s.UpdateBatch(ctx, []models.Metrics{
+		gauge(gaugeName, 1.5),
+		counter(counterName, 5),
+		gauge(gaugeName, 7.25),
+		counter(counterName, 3),
+	})
+	if err != nil {
+		t.Fatalf("UpdateBatch error = %v", err)
+	}
+
+	if got, err := s.GetGauge(ctx, gaugeName); err != nil || got != 7.25 {
+		t.Errorf("gauge = %v (err %v), want 7.25", got, err)
+	}
+	if got, err := s.GetCounter(ctx, counterName); err != nil || got != 12 {
+		t.Errorf("counter = %v (err %v), want 12 (4+5+3)", got, err)
+	}
+}
+
+func TestPgStorageUpdateBatchEmpty(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := s.UpdateBatch(ctx, nil); err != nil {
+		t.Fatalf("UpdateBatch(nil) error = %v", err)
+	}
+}
+
+// TestPgStorageUpdateBatchIsAllOrNothing verifies that a malformed metric
+// anywhere in the batch leaves the database untouched.
+func TestPgStorageUpdateBatchIsAllOrNothing(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	name := t.Name()
+	err := s.UpdateBatch(ctx, []models.Metrics{
+		gauge(name, 1.5),
+		{ID: name + "-broken", MType: "histogram"},
+	})
+	if !errors.Is(err, models.ErrInvalidMetric) {
+		t.Fatalf("UpdateBatch error = %v, want ErrInvalidMetric", err)
+	}
+
+	if _, err := s.GetGauge(ctx, name); !errors.Is(err, models.ErrNotFound) {
+		t.Fatalf("gauge error = %v, want ErrNotFound — the batch was rejected", err)
+	}
+}
+
+// TestPgStorageUpdateBatchRollsBackOnCancelledContext verifies that a cancelled
+// context rolls the transaction back rather than leaving half of the batch
+// committed.
+func TestPgStorageUpdateBatchRollsBackOnCancelledContext(t *testing.T) {
+	s := newTestPgStorage(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	name := t.Name()
+	if err := s.UpdateBatch(ctx, []models.Metrics{gauge(name, 1.5)}); err == nil {
+		t.Fatal("UpdateBatch with a cancelled context returned nil, want error")
+	}
+
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer checkCancel()
+	if _, err := s.GetGauge(checkCtx, name); !errors.Is(err, models.ErrNotFound) {
+		t.Fatalf("gauge error = %v, want ErrNotFound — the transaction was rolled back", err)
+	}
+}
+
+// TestPgStorageConcurrentBatchesDoNotDeadlock verifies that batches touching
+// the same rows from several connections neither deadlock nor lose increments:
+// the rows are ordered identically everywhere.
+func TestPgStorageConcurrentBatchesDoNotDeadlock(t *testing.T) {
+	s := newTestPgStorage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	const (
+		writers = 8
+		rounds  = 20
+	)
+	first := t.Name() + "-a"
+	second := t.Name() + "-b"
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for range rounds {
+				batch := []models.Metrics{counter(first, 1), counter(second, 1)}
+				if i%2 == 1 {
+					batch[0], batch[1] = batch[1], batch[0]
+				}
+				if err := s.UpdateBatch(ctx, batch); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if len(errs) > 0 {
+		t.Fatalf("concurrent UpdateBatch errors = %v", errs)
+	}
+
+	want := int64(writers * rounds)
+	for _, name := range []string{first, second} {
+		got, err := s.GetCounter(ctx, name)
+		if err != nil {
+			t.Fatalf("GetCounter(%q) error = %v", name, err)
+		}
+		if got != want {
+			t.Fatalf("counter %q = %d, want %d", name, got, want)
+		}
 	}
 }

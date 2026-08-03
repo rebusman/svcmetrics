@@ -20,7 +20,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/sirupsen/logrus"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
@@ -81,7 +81,7 @@ func newTestServer(t *testing.T, pinger interface {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	r := newRouter(log, storage.NewMemStorage(), pinger)
+	r := newRouter(log, repository.NewMemStorage(), pinger)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv
@@ -89,7 +89,7 @@ func newTestServer(t *testing.T, pinger interface {
 
 // newPgStorage builds a PgStorage against the shared container, applying the
 // migrations, and clears the metrics table so tests do not see each other's rows.
-func newPgStorage(t *testing.T) *storage.PgStorage {
+func newPgStorage(t *testing.T) *repository.PgStorage {
 	t.Helper()
 
 	if sharedDSN == "" {
@@ -97,7 +97,7 @@ func newPgStorage(t *testing.T) *storage.PgStorage {
 	}
 
 	ctx := context.Background()
-	pg, err := storage.NewPgStorage(ctx, sharedDSN)
+	pg, err := repository.NewPgStorage(ctx, sharedDSN)
 	if err != nil {
 		t.Fatalf("failed to create pg storage: %v", err)
 	}
@@ -135,8 +135,6 @@ func TestE2EPostgresStorageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	// The response carries the accumulated total straight from the upsert, so
-	// each cycle must report the running sum rather than the delta sent.
 	for i := range 2 {
 		resp, err := client.Post(srv.URL+"/update", "application/json", bytes.NewReader(body))
 		if err != nil {
@@ -158,8 +156,7 @@ func TestE2EPostgresStorageRoundTrip(t *testing.T) {
 		}
 	}
 
-	// The values must survive a fresh storage instance, i.e. live in the database.
-	fresh, err := storage.NewPgStorage(context.Background(), sharedDSN)
+	fresh, err := repository.NewPgStorage(context.Background(), sharedDSN)
 	if err != nil {
 		t.Fatalf("failed to reopen pg storage: %v", err)
 	}
@@ -427,9 +424,9 @@ func TestE2EListHTML(t *testing.T) {
 	t.Log("e2e OK: GET / rendered the stored metric name")
 }
 
-// Concurrent counter updates go through a single INSERT ... ON CONFLICT ...
-// RETURNING, so every request must observe its own running total and no
-// increment may be lost.
+// TestE2EConcurrentCounterUpdatesArePersistedExactly verifies that concurrent
+// counter updates go through a single INSERT ... ON CONFLICT ... RETURNING, so
+// every request observes its own running total and no increment is lost.
 func TestE2EConcurrentCounterUpdatesArePersistedExactly(t *testing.T) {
 	pg := newPgStorage(t)
 
@@ -505,8 +502,8 @@ func TestE2EConcurrentCounterUpdatesArePersistedExactly(t *testing.T) {
 	t.Logf("e2e OK: %d concurrent updates each saw a distinct total, database holds %d", writers, stored)
 }
 
-// The agent always reports gzipped, so the compressed request path has to work
-// against a real server and a real database.
+// TestE2EGzipRoundTripAgainstPostgres exercises the compressed request path
+// against a real server and a real database: the agent always reports gzipped.
 func TestE2EGzipRoundTripAgainstPostgres(t *testing.T) {
 	pg := newPgStorage(t)
 
@@ -538,8 +535,6 @@ func TestE2EGzipRoundTripAgainstPostgres(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
-	// Ask for a compressed answer too, and read it undecoded to prove the
-	// server really compressed rather than relying on transport transparency.
 	req.Header.Set("Accept-Encoding", "gzip")
 
 	resp, err := client.Do(req)
@@ -569,7 +564,6 @@ func TestE2EGzipRoundTripAgainstPostgres(t *testing.T) {
 		t.Fatalf("response value = %v, want %v", echoed.Value, value)
 	}
 
-	// And it actually reached the database.
 	stored, err := pg.GetGauge(context.Background(), "HeapAlloc")
 	if err != nil {
 		t.Fatalf("GetGauge error = %v", err)
@@ -581,13 +575,14 @@ func TestE2EGzipRoundTripAgainstPostgres(t *testing.T) {
 	t.Logf("e2e OK: gzipped request and response round-tripped through PostgreSQL (%v)", stored)
 }
 
-// Without a database configured the router still serves metrics, and /ping is
-// the only endpoint that reports the missing dependency.
+// TestE2EPingWithoutDatabase verifies that without a database configured the
+// router still serves metrics and /ping is the only endpoint that reports the
+// missing dependency.
 func TestE2EPingWithoutDatabase(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	srv := httptest.NewServer(newRouter(log, storage.NewMemStorage(), nil))
+	srv := httptest.NewServer(newRouter(log, repository.NewMemStorage(), nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/ping")
@@ -613,3 +608,89 @@ func TestE2EPingWithoutDatabase(t *testing.T) {
 }
 
 func float64Ptr(v float64) *float64 { return &v }
+
+// TestE2EGzippedBatchAgainstPostgres exercises the batch endpoint through the
+// whole stack: gzipped request, one transaction, PostgreSQL behind it.
+func TestE2EGzippedBatchAgainstPostgres(t *testing.T) {
+	pg := newPgStorage(t)
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	srv := httptest.NewServer(newRouter(log, pg, pg))
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	alloc, heap := 1.5, 42.25
+	delta := int64(7)
+	extra := int64(3)
+	raw, err := json.Marshal([]models.Metrics{
+		{ID: "Alloc", MType: models.Gauge, Value: &alloc},
+		{ID: "HeapAlloc", MType: models.Gauge, Value: &heap},
+		{ID: "PollCount", MType: models.Counter, Delta: &delta},
+		{ID: "PollCount", MType: models.Counter, Delta: &extra},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/updates/", bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /updates/ failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /updates/ status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	ctx := context.Background()
+	if got, err := pg.GetGauge(ctx, "Alloc"); err != nil || got != alloc {
+		t.Errorf("Alloc = %v (err %v), want %v", got, err, alloc)
+	}
+	if got, err := pg.GetGauge(ctx, "HeapAlloc"); err != nil || got != heap {
+		t.Errorf("HeapAlloc = %v (err %v), want %v", got, err, heap)
+	}
+	if got, err := pg.GetCounter(ctx, "PollCount"); err != nil || got != delta+extra {
+		t.Errorf("PollCount = %v (err %v), want %v", got, err, delta+extra)
+	}
+
+	bad, err := json.Marshal([]models.Metrics{
+		{ID: "Sys", MType: models.Gauge, Value: &alloc},
+		{ID: "Broken", MType: "histogram"},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	badResp, err := client.Post(srv.URL+"/updates/", "application/json", bytes.NewReader(bad))
+	if err != nil {
+		t.Fatalf("POST /updates/ failed: %v", err)
+	}
+	defer badResp.Body.Close()
+
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed batch status = %d, want %d", badResp.StatusCode, http.StatusBadRequest)
+	}
+	if _, err := pg.GetGauge(ctx, "Sys"); !errors.Is(err, models.ErrNotFound) {
+		t.Fatalf("Sys error = %v, want ErrNotFound — the batch was rejected as a whole", err)
+	}
+
+	t.Logf("e2e OK: gzipped batch committed in one transaction against PostgreSQL")
+}

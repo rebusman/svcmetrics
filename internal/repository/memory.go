@@ -1,4 +1,4 @@
-package storage
+package repository
 
 import (
 	"context"
@@ -11,12 +11,15 @@ import (
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
+// MemStorage keeps metrics in memory and can persist them to a JSON file.
+// Every method is safe for concurrent use.
 type MemStorage struct {
 	mu       sync.RWMutex
 	gauges   map[string]float64
 	counters map[string]int64
 }
 
+// NewMemStorage returns an empty in-memory storage.
 func NewMemStorage() *MemStorage {
 	return &MemStorage{
 		gauges:   make(map[string]float64),
@@ -24,6 +27,7 @@ func NewMemStorage() *MemStorage {
 	}
 }
 
+// UpdateGauge stores value under name and returns it.
 func (s *MemStorage) UpdateGauge(_ context.Context, name string, value float64) (float64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -31,6 +35,7 @@ func (s *MemStorage) UpdateGauge(_ context.Context, name string, value float64) 
 	return value, nil
 }
 
+// UpdateCounter adds value to the counter and returns the running total.
 func (s *MemStorage) UpdateCounter(_ context.Context, name string, value int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -38,6 +43,34 @@ func (s *MemStorage) UpdateCounter(_ context.Context, name string, value int64) 
 	return s.counters[name], nil
 }
 
+// UpdateBatch applies the batch under a single lock, so a reader never observes
+// half of it. The batch is validated before the lock is taken: a malformed one
+// leaves the storage untouched and returns models.ErrInvalidMetric.
+func (s *MemStorage) UpdateBatch(_ context.Context, metrics []models.Metrics) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+
+	batch, err := aggregateBatch(metrics)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, m := range batch {
+		switch m.MType {
+		case models.Gauge:
+			s.gauges[m.ID] = *m.Value
+		case models.Counter:
+			s.counters[m.ID] += *m.Delta
+		}
+	}
+	return nil
+}
+
+// GetGauge returns the stored gauge, or models.ErrNotFound if it is absent.
 func (s *MemStorage) GetGauge(_ context.Context, name string) (float64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -48,6 +81,7 @@ func (s *MemStorage) GetGauge(_ context.Context, name string) (float64, error) {
 	return val, nil
 }
 
+// GetCounter returns the stored counter, or models.ErrNotFound if it is absent.
 func (s *MemStorage) GetCounter(_ context.Context, name string) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -58,6 +92,7 @@ func (s *MemStorage) GetCounter(_ context.Context, name string) (int64, error) {
 	return val, nil
 }
 
+// GetAllGauges returns a copy of every stored gauge.
 func (s *MemStorage) GetAllGauges(_ context.Context) (map[string]float64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -68,6 +103,7 @@ func (s *MemStorage) GetAllGauges(_ context.Context) (map[string]float64, error)
 	return res, nil
 }
 
+// GetAllCounters returns a copy of every stored counter.
 func (s *MemStorage) GetAllCounters(_ context.Context) (map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -79,6 +115,7 @@ func (s *MemStorage) GetAllCounters(_ context.Context) (map[string]int64, error)
 
 }
 
+// snapshot copies the current state into a flat metric slice.
 func (s *MemStorage) snapshot() []models.Metrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -95,6 +132,8 @@ func (s *MemStorage) snapshot() []models.Metrics {
 	return metrics
 }
 
+// Save writes a snapshot to path atomically: the data lands in a temporary
+// file next to the target, which then replaces it by a rename.
 func (s *MemStorage) Save(path string) error {
 	metrics := s.snapshot()
 
@@ -114,7 +153,6 @@ func (s *MemStorage) Save(path string) error {
 		return err
 	}
 
-	// CreateTemp makes the file 0600; keep the mode the snapshot used to have.
 	if err := os.Chmod(tmpName, 0644); err != nil {
 		os.Remove(tmpName)
 		return err
@@ -141,6 +179,8 @@ func writeAndClose(f *os.File, data []byte) error {
 	return f.Close()
 }
 
+// Load restores metrics from a snapshot written by Save, merging them into
+// whatever the storage already holds.
 func (s *MemStorage) Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {

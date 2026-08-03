@@ -11,12 +11,12 @@ import (
 	"testing"
 
 	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
 func TestValueHandler(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
 	_, _ = s.UpdateCounter(ctx, "PollCount", 5)
 	r := newTestRouter(s)
@@ -50,11 +50,12 @@ func TestValueHandler(t *testing.T) {
 	}
 }
 
-// Gauges are formatted without a trailing exponent or padding, so the plain
-// text endpoint returns exactly what a client can parse back.
+// TestValueHandlerFormatsGauges verifies that gauges are rendered without a
+// trailing exponent or padding, so a client can parse back exactly what the
+// plain text endpoint returned.
 func TestValueHandlerFormatsGauges(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	r := newTestRouter(s)
 
 	tests := []struct {
@@ -90,7 +91,7 @@ func TestValueHandlerFormatsGauges(t *testing.T) {
 
 func TestValueJSONHandler(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	gaugeVal := 12.5
 	_, _ = s.UpdateGauge(ctx, "Alloc", gaugeVal)
 	_, _ = s.UpdateCounter(ctx, "PollCount", 7)
@@ -163,7 +164,7 @@ func TestValueJSONHandler(t *testing.T) {
 }
 
 func TestValueJSONHandlerRejectsBadRequests(t *testing.T) {
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	r := newTestRouter(s)
 
 	tests := []struct {
@@ -193,7 +194,7 @@ func TestValueJSONHandlerRejectsBadRequests(t *testing.T) {
 
 func TestListHandler(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
 	_, _ = s.UpdateCounter(ctx, "PollCount", 3)
 	r := newTestRouter(s)
@@ -218,7 +219,7 @@ func TestListHandler(t *testing.T) {
 }
 
 func TestListHandlerOnEmptyStorage(t *testing.T) {
-	r := newTestRouter(storage.NewMemStorage())
+	r := newTestRouter(repository.NewMemStorage())
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -262,11 +263,12 @@ func (f *failingWriter) Write(p []byte) (int, error) {
 	return 0, errors.New("connection reset by peer")
 }
 
-// Once the 200 is committed the handler cannot take it back, so a failed body
-// write must not append an error message on top of the JSON.
+// TestJSONHandlersDoNotAppendErrorAfterCommitting verifies that a failed body
+// write does not append an error message on top of the JSON: once the 200 is
+// committed the handler cannot take it back.
 func TestJSONHandlersDoNotAppendErrorAfterCommitting(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
 	r := newTestRouter(s)
 
@@ -295,8 +297,6 @@ func TestJSONHandlersDoNotAppendErrorAfterCommitting(t *testing.T) {
 			if got := w.attempted.String(); strings.Contains(got, "Internal Server Error") {
 				t.Errorf("handler appended an error to the committed body: %q", got)
 			}
-			// The body must be attempted in one shot, so a partial write cannot
-			// be followed by unrelated bytes.
 			if w.writeAttempts != 1 {
 				t.Errorf("body written in %d calls, want 1", w.writeAttempts)
 			}
@@ -322,6 +322,7 @@ func (e errStorage) UpdateGauge(context.Context, string, float64) (float64, erro
 func (e errStorage) UpdateCounter(context.Context, string, int64) (int64, error) {
 	return 0, e.err
 }
+func (e errStorage) UpdateBatch(context.Context, []models.Metrics) error { return e.err }
 
 func TestReadHandlersReportStorageFailuresAs500(t *testing.T) {
 	s := errStorage{err: errors.New("database is on fire")}
@@ -356,8 +357,9 @@ func TestReadHandlersReportStorageFailuresAs500(t *testing.T) {
 	}
 }
 
-// The counter list is read after the gauge list, so a failure there must also
-// surface instead of rendering a half-filled page.
+// TestListHandlerReportsCounterFailure verifies that a failure of the counter
+// read, which happens after the gauge read, surfaces instead of rendering a
+// half-filled page.
 func TestListHandlerReportsCounterFailure(t *testing.T) {
 	r := newTestRouter(countersFailStorage{err: errors.New("counters unavailable")})
 

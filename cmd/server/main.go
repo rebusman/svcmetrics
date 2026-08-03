@@ -1,3 +1,7 @@
+// Command server serves the metrics HTTP API and persists the metrics in
+// PostgreSQL, in a JSON file or in memory. Settings come from flags and are
+// overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE and
+// DATABASE_DSN environment variables.
 package main
 
 import (
@@ -15,25 +19,29 @@ import (
 	"time"
 
 	"github.com/rebusman/svcmetrics/internal/handler"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/sirupsen/logrus"
 )
 
+// responseWriter records the status code, the body size and the first failed
+// body write so that the logging middleware can report them. The handlers
+// cannot report a write failure themselves: by then the status line is already
+// on the wire.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	bodySize   int
-	// writeErr holds the first failed body write. The handlers cannot report
-	// it themselves — by then the status line is already on the wire — so it
-	// is recorded here and logged with the rest of the request.
-	writeErr error
+	writeErr   error
 }
 
+// WriteHeader records the status code and writes the status line.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Write records the body size and the first write failure.
 func (rw *responseWriter) Write(b []byte) (int, error) {
 	size, err := rw.ResponseWriter.Write(b)
 	rw.bodySize += size
@@ -43,15 +51,17 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
-// Flush and Hijack keep working through the wrapper: wrapping a ResponseWriter
-// hides whatever optional interfaces it implements, and the gzip writer below
-// expects both to survive the decoration.
+// Flush forwards to the underlying ResponseWriter. Wrapping a ResponseWriter
+// hides the optional interfaces it implements, and the gzip writer expects this
+// one to survive the decoration.
 func (rw *responseWriter) Flush() {
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
 }
 
+// Hijack forwards to the underlying ResponseWriter, keeping the optional
+// interface available through the wrapper.
 func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -60,22 +70,25 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return hijacker.Hijack()
 }
 
-// syncStorage decorates MemStorage to persist metrics to disk synchronously
-// after every write. It is used when STORE_INTERVAL == 0.
+// syncStorage decorates MemStorage to persist the metrics to disk synchronously
+// after every write. It is used when STORE_INTERVAL is 0.
 type syncStorage struct {
-	*storage.MemStorage
+	*repository.MemStorage
 	path string
 	log  *logrus.Logger
 }
 
-var _ storage.Storage = (*syncStorage)(nil)
+var _ repository.Storage = (*syncStorage)(nil)
 
+// save writes a snapshot to disk, logging a failure rather than failing the
+// request.
 func (s *syncStorage) save() {
 	if err := s.Save(s.path); err != nil {
 		s.log.Errorf("Failed to save metrics to %s: %v", s.path, err)
 	}
 }
 
+// UpdateGauge stores the gauge and flushes the snapshot to disk.
 func (s *syncStorage) UpdateGauge(ctx context.Context, name string, value float64) (float64, error) {
 	stored, err := s.MemStorage.UpdateGauge(ctx, name, value)
 	if err != nil {
@@ -85,6 +98,7 @@ func (s *syncStorage) UpdateGauge(ctx context.Context, name string, value float6
 	return stored, nil
 }
 
+// UpdateCounter stores the counter and flushes the snapshot to disk.
 func (s *syncStorage) UpdateCounter(ctx context.Context, name string, value int64) (int64, error) {
 	stored, err := s.MemStorage.UpdateCounter(ctx, name, value)
 	if err != nil {
@@ -94,6 +108,21 @@ func (s *syncStorage) UpdateCounter(ctx context.Context, name string, value int6
 	return stored, nil
 }
 
+// UpdateBatch stores the batch and flushes the snapshot to disk once for the
+// whole batch rather than once per metric.
+func (s *syncStorage) UpdateBatch(ctx context.Context, metrics []models.Metrics) error {
+	if err := s.MemStorage.UpdateBatch(ctx, metrics); err != nil {
+		return err
+	}
+	if len(metrics) > 0 {
+		s.save()
+	}
+	return nil
+}
+
+// loggingMiddleware logs one line per request with its method, URI, status,
+// body size and duration. A failed body write cannot be conveyed to the client,
+// so it is logged at a louder level instead.
 func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,9 +142,6 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 				"body_size":   rw.bodySize,
 			})
 
-			// A failed body write is not something the response can convey —
-			// the client already got the status — so it is only worth a log
-			// line, at a level that stands out from the successful requests.
 			if rw.writeErr != nil {
 				entry.WithError(rw.writeErr).Error("Failed to write response body")
 				return
@@ -126,6 +152,10 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 	}
 }
 
+// main reads the settings, picks a storage — PostgreSQL, then a file-backed
+// in-memory one, then plain memory — and serves until the process is asked to
+// stop. The final snapshot is written here rather than in the saver goroutine,
+// so the process cannot exit while that write is still in flight.
 func main() {
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	storeInterval := flag.Int("i", 300, "save interval in seconds")
@@ -167,20 +197,16 @@ func main() {
 		*databaseDSN = envDatabaseDSN
 	}
 
-	// hs is the storage the handlers work through. Preference order: PostgreSQL,
-	// then a file-backed in-memory storage, then plain memory.
 	var (
-		hs     storage.Storage
-		pinger handler.Pinger
-		// fileStore is non-nil only when metrics are persisted to a file; the
-		// periodic saver and the shutdown flush use it.
-		fileStore *storage.MemStorage
+		hs        repository.Storage
+		pinger    handler.Pinger
+		fileStore *repository.MemStorage
 	)
 
 	switch {
 	case *databaseDSN != "":
 		initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		pg, err := storage.NewPgStorage(initCtx, *databaseDSN)
+		pg, err := repository.NewPgStorage(initCtx, *databaseDSN)
 		cancel()
 		if err != nil {
 			log.Fatalf("Failed to initialize database storage: %v", err)
@@ -195,7 +221,7 @@ func main() {
 		log.Info("Using PostgreSQL storage")
 
 	case *fileStoragePath != "":
-		s := storage.NewMemStorage()
+		s := repository.NewMemStorage()
 		if *restore {
 			if err := s.Load(*fileStoragePath); err != nil {
 				log.Errorf("Failed to restore metrics from %s: %v", *fileStoragePath, err)
@@ -205,9 +231,6 @@ func main() {
 		}
 		fileStore = s
 
-		// With STORE_INTERVAL == 0 every write is flushed to disk
-		// synchronously; otherwise a background ticker persists metrics
-		// periodically.
 		hs = s
 		if *storeInterval == 0 {
 			hs = &syncStorage{MemStorage: s, path: *fileStoragePath, log: log}
@@ -215,7 +238,7 @@ func main() {
 		log.Infof("Using in-memory storage persisted to %s", *fileStoragePath)
 
 	default:
-		hs = storage.NewMemStorage()
+		hs = repository.NewMemStorage()
 		log.Info("Using in-memory storage")
 	}
 
@@ -245,9 +268,6 @@ func main() {
 			for {
 				select {
 				case <-ctx.Done():
-					// The shutdown flush happens in main, not here: this
-					// goroutine has no chance to finish a write once main
-					// returns and the process exits.
 					return
 				case <-ticker.C:
 					if err := fileStore.Save(*fileStoragePath); err != nil {
@@ -267,9 +287,6 @@ func main() {
 		log.Errorf("Server shutdown failed: %v", err)
 	}
 
-	// Persist the final state once the server has stopped accepting requests.
-	// Done here rather than in the ticker goroutine so that the process cannot
-	// exit while the write is still in flight.
 	if fileStore != nil {
 		if err := fileStore.Save(*fileStoragePath); err != nil {
 			log.Errorf("Failed to save metrics to %s on shutdown: %v", *fileStoragePath, err)

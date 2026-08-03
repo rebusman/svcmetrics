@@ -1,15 +1,26 @@
+// Package models defines the metric representation shared by the server, the
+// agent and the storages.
 package models
 
 import "errors"
 
+// Metric types supported by the service.
 const (
 	Counter = "counter"
 	Gauge   = "gauge"
 )
 
-var ErrNotFound = errors.New("metric not found")
+var (
+	// ErrNotFound reports that the requested metric is absent from the storage.
+	ErrNotFound = errors.New("metric not found")
 
-// Special metric names that are not part of the runtime package.
+	// ErrInvalidMetric reports a metric the caller sent wrong: unknown type,
+	// missing ID or a value that does not match the type. Storages return it so
+	// that handlers can answer 400 instead of 500.
+	ErrInvalidMetric = errors.New("invalid metric")
+)
+
+// Metric names that the runtime package does not provide.
 const (
 	PollCount   = "PollCount"
 	RandomValue = "RandomValue"
@@ -50,11 +61,9 @@ var GaugeMetricNames = []string{
 // CounterMetricNames is the single source of truth for the collected counter metrics.
 var CounterMetricNames = []string{PollCount}
 
-// NOTE: Не усложняем пример, вводя иерархическую вложенность структур.
-// Органичиваясь плоской моделью.
-// Delta и Value объявлены через указатели,
-// что бы отличать значение "0", от не заданного значения
-// и соответственно не кодировать в структуру.
+// Metrics is the flat wire representation of a single metric. Delta and Value
+// are pointers so that an unset field stays distinguishable from a stored zero
+// and is left out of the JSON encoding.
 type Metrics struct {
 	ID    string   `json:"id"`
 	MType string   `json:"type"`
