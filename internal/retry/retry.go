@@ -9,6 +9,7 @@ package retry
 
 import (
 	"context"
+	"math/rand/v2"
 	"time"
 )
 
@@ -26,6 +27,12 @@ var DefaultIntervals = []time.Duration{
 // with a non-nil error.
 type IsRetriable func(error) bool
 
+// OnRetry observes a failed attempt that is about to be repeated. It receives
+// the error of the attempt, its one-based number and the pause taken before
+// the next one. A typical implementation logs the failure so that passing
+// problems do not stay invisible.
+type OnRetry func(err error, attempt int, pause time.Duration)
+
 // Config describes how an operation is repeated. The zero value retries every
 // error on the default schedule, which is rarely what a caller wants: an
 // [IsRetriable] that returns false for permanent failures keeps a request from
@@ -38,6 +45,11 @@ type Config struct {
 	// Retriable classifies the failures. A nil check treats every error as
 	// retriable.
 	Retriable IsRetriable
+
+	// OnRetry, when non-nil, is called before every repetition with the error
+	// of the failed attempt, its one-based number and the pause about to be
+	// taken. A nil OnRetry repeats silently.
+	OnRetry OnRetry
 }
 
 // intervals returns the schedule c runs on.
@@ -80,10 +92,24 @@ func DoValue[T any](ctx context.Context, cfg Config, fn func(ctx context.Context
 		if attempt >= len(intervals) || !cfg.retriable(err) {
 			return res, err
 		}
-		if !wait(ctx, intervals[attempt]) {
+		pause := withJitter(intervals[attempt])
+		if cfg.OnRetry != nil {
+			cfg.OnRetry(err, attempt+1, pause)
+		}
+		if !wait(ctx, pause) {
 			return res, err
 		}
 	}
+}
+
+// withJitter stretches d by a random fraction of up to a quarter of its
+// length, so that many clients recovering from the same outage do not repeat
+// their attempts in lockstep.
+func withJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + rand.N(d/4+1)
 }
 
 // wait sleeps for d and reports whether it slept through: a cancelled context

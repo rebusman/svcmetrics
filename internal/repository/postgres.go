@@ -53,6 +53,12 @@ func NewPgStorage(ctx context.Context, dsn string) (*PgStorage, error) {
 	return s, nil
 }
 
+// SetOnRetry installs fn as the observer of the repeated database calls, so
+// the caller can log the failures the storage recovers from.
+func (s *PgStorage) SetOnRetry(fn retry.OnRetry) {
+	s.retry.OnRetry = fn
+}
+
 // UpdateGauge stores value under name and returns what the database kept.
 func (s *PgStorage) UpdateGauge(ctx context.Context, name string, value float64) (float64, error) {
 	stored, err := retry.DoValue(ctx, s.retry, func(ctx context.Context) (float64, error) {

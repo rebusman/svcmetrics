@@ -114,6 +114,7 @@ func TestUpdatesJSONHandlerMapsStorageErrors(t *testing.T) {
 		{name: "invalid metric", storageErr: fmt.Errorf("batch: %w", models.ErrInvalidMetric), wantStatus: http.StatusBadRequest},
 		{name: "not found", storageErr: fmt.Errorf("batch: %w", models.ErrNotFound), wantStatus: http.StatusNotFound},
 		{name: "other failure", storageErr: errors.New("connection refused"), wantStatus: http.StatusInternalServerError},
+		{name: "deadline exceeded", storageErr: fmt.Errorf("batch: %w", context.DeadlineExceeded), wantStatus: http.StatusGatewayTimeout},
 	}
 
 	for _, tt := range tests {

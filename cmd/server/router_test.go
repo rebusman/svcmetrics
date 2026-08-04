@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"go.uber.org/mock/gomock"
@@ -125,6 +127,53 @@ func TestRouterKeepsSingleMetricEndpoints(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s %s: status = %d, want 200 (body = %q)", req.method, req.path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestRouterBoundsTheRequestTime verifies that the storage is called with a
+// context that already carries the request deadline, which is what lets a call
+// hanging on the database end with an answer instead of holding the connection.
+func TestRouterBoundsTheRequestTime(t *testing.T) {
+	storage, _, r := newMockedServer(t)
+
+	storage.EXPECT().UpdateBatch(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ []models.Metrics) error {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("the storage was called with a context without a deadline")
+			}
+			if left := time.Until(deadline); left <= 0 || left > requestTimeout {
+				t.Errorf("deadline is %s away, want at most %s", left, requestTimeout)
+			}
+			return nil
+		}).
+		Times(1)
+
+	body := `[{"id":"Alloc","type":"gauge","value":1.5}]`
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %q)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRouterAnswersGatewayTimeoutOnAnExpiredDeadline verifies the status a
+// request gets when it runs past the deadline the router set: the storage sees
+// a cancelled context and its error becomes 504 rather than 500.
+func TestRouterAnswersGatewayTimeoutOnAnExpiredDeadline(t *testing.T) {
+	storage, _, r := newMockedServer(t)
+
+	storage.EXPECT().UpdateBatch(gomock.Any(), gomock.Any()).
+		Return(fmt.Errorf("batch: %w", context.DeadlineExceeded)).
+		Times(1)
+
+	body := `[{"id":"Alloc","type":"gauge","value":1.5}]`
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(body)))
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d (body = %q)", rec.Code, http.StatusGatewayTimeout, rec.Body.String())
 	}
 }
 

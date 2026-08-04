@@ -181,6 +181,16 @@ func TestIsRetriableFileError(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "read-only filesystem",
+			err:  &fs.PathError{Op: "open", Path: "metrics.json", Err: syscall.EROFS},
+			want: false,
+		},
+		{
+			name: "path component is not a directory",
+			err:  &fs.PathError{Op: "open", Path: "metrics.json/deep.json", Err: syscall.ENOTDIR},
+			want: false,
+		},
+		{
 			name: "malformed snapshot",
 			err:  syntaxErr,
 			want: false,
@@ -191,6 +201,69 @@ func TestIsRetriableFileError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isRetriableFileError(tt.err); got != tt.want {
 				t.Fatalf("isRetriableFileError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsRetriableFileErrorOnRealOSErrors feeds isRetriableFileError the errors
+// the operating system actually produces instead of hand-built ones, so that a
+// platform whose errno differs from the assumption is caught here rather than
+// in production. Only the cases that both Windows and Unix report the same way
+// live here; the ones that diverge are covered by the platform-specific tests
+// next to this file.
+func TestIsRetriableFileErrorOnRealOSErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name string
+		op   func() error
+		want bool
+	}{
+		{
+			name: "read of a missing file",
+			op: func() error {
+				_, err := os.ReadFile(filepath.Join(dir, "absent.json"))
+				return err
+			},
+			want: false,
+		},
+		{
+			name: "write into a missing directory",
+			op: func() error {
+				return os.WriteFile(filepath.Join(dir, "absent", "metrics.json"), []byte("[]"), 0644)
+			},
+			want: false,
+		},
+		{
+			name: "write over a directory",
+			op: func() error {
+				return os.WriteFile(dir, []byte("[]"), 0644)
+			},
+			want: false,
+		},
+		{
+			name: "read through a file used as a directory",
+			op: func() error {
+				file := filepath.Join(dir, "notadir")
+				if err := os.WriteFile(file, []byte("[]"), 0644); err != nil {
+					t.Fatalf("prepare: %v", err)
+				}
+				_, err := os.ReadFile(filepath.Join(file, "metrics.json"))
+				return err
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.op()
+			if err == nil {
+				t.Fatal("the operation was expected to fail")
+			}
+			if got := isRetriableFileError(err); got != tt.want {
+				t.Fatalf("isRetriableFileError(%v) = %v, want %v", err, got, tt.want)
 			}
 		})
 	}
@@ -208,7 +281,7 @@ func TestSaveFailsFastOnPermanentError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing-dir", "metrics.json")
 
 	start := time.Now()
-	err := s.Save(path)
+	err := s.Save(context.Background(), path)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -233,7 +306,7 @@ func TestLoadFailsFastOnMalformedSnapshot(t *testing.T) {
 	s := NewMemStorage()
 
 	start := time.Now()
-	err := s.Load(path)
+	err := s.Load(context.Background(), path)
 	elapsed := time.Since(start)
 
 	if err == nil {

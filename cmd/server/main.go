@@ -21,6 +21,7 @@ import (
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
+	"github.com/rebusman/svcmetrics/internal/retry"
 	"github.com/sirupsen/logrus"
 )
 
@@ -91,9 +92,10 @@ type syncStorage struct {
 var _ repository.Storage = (*syncStorage)(nil)
 
 // save writes a snapshot to disk, logging a failure rather than failing the
-// request.
-func (s *syncStorage) save() {
-	if err := s.Save(s.path); err != nil {
+// request: losing one snapshot is cheaper than failing the update that
+// produced it, and the next write will carry the same state anyway.
+func (s *syncStorage) save(ctx context.Context) {
+	if err := s.Save(ctx, s.path); err != nil {
 		s.log.Errorf("Failed to save metrics to %s: %v", s.path, err)
 	}
 }
@@ -104,7 +106,7 @@ func (s *syncStorage) UpdateGauge(ctx context.Context, name string, value float6
 	if err != nil {
 		return 0, err
 	}
-	s.save()
+	s.save(ctx)
 	return stored, nil
 }
 
@@ -114,7 +116,7 @@ func (s *syncStorage) UpdateCounter(ctx context.Context, name string, value int6
 	if err != nil {
 		return 0, err
 	}
-	s.save()
+	s.save(ctx)
 	return stored, nil
 }
 
@@ -125,7 +127,7 @@ func (s *syncStorage) UpdateBatch(ctx context.Context, metrics []models.Metrics)
 		return err
 	}
 	if len(metrics) > 0 {
-		s.save()
+		s.save(ctx)
 	}
 	return nil
 }
@@ -226,14 +228,16 @@ func main() {
 				log.Errorf("Failed to close database connection: %v", err)
 			}
 		}()
+		pg.SetOnRetry(retryLogger(log, "database call"))
 		hs = pg
 		pinger = pg
 		log.Info("Using PostgreSQL storage")
 
 	case *fileStoragePath != "":
 		s := repository.NewMemStorage()
+		s.SetOnRetry(retryLogger(log, "snapshot file operation"))
 		if *restore {
-			if err := s.Load(*fileStoragePath); err != nil {
+			if err := s.Load(context.Background(), *fileStoragePath); err != nil {
 				log.Errorf("Failed to restore metrics from %s: %v", *fileStoragePath, err)
 			} else {
 				log.Infof("Metrics restored from %s", *fileStoragePath)
@@ -257,12 +261,15 @@ func main() {
 
 	r := newRouter(log, hs, pinger)
 
+	// The write timeout sits above requestTimeout on purpose: the router gives
+	// up on a request first and answers 504, and the connection is only dropped
+	// if even that answer does not get out in time.
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      requestTimeout + 3*time.Second,
 	}
 
 	go func() {
@@ -280,7 +287,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := fileStore.Save(*fileStoragePath); err != nil {
+					if err := fileStore.Save(ctx, *fileStoragePath); err != nil {
 						log.Errorf("Failed to save metrics to %s: %v", *fileStoragePath, err)
 					}
 				}
@@ -298,8 +305,18 @@ func main() {
 	}
 
 	if fileStore != nil {
-		if err := fileStore.Save(*fileStoragePath); err != nil {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := fileStore.Save(saveCtx, *fileStoragePath); err != nil {
 			log.Errorf("Failed to save metrics to %s on shutdown: %v", *fileStoragePath, err)
 		}
+		cancel()
+	}
+}
+
+// retryLogger adapts log to [retry.OnRetry], naming the operation being
+// repeated so that recovered failures show up in the server log.
+func retryLogger(log *logrus.Logger, op string) retry.OnRetry {
+	return func(err error, attempt int, pause time.Duration) {
+		log.Warnf("Retrying %s (attempt %d) in %s: %v", op, attempt, pause, err)
 	}
 }

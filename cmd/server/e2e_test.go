@@ -30,7 +30,7 @@ var sharedDSN string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
+	pgContainer, err := postgres.Run(ctx, "postgres:16.4-alpine",
 		postgres.WithDatabase("metrics"),
 		postgres.WithUsername("metrics"),
 		postgres.WithPassword("metrics"),

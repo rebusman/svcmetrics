@@ -4,6 +4,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,14 +16,17 @@ import (
 	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
-// writeStorageError replies 404 for a missing metric, 400 for a malformed one
-// and 500 for any other storage failure.
+// writeStorageError replies 404 for a missing metric, 400 for a malformed one,
+// 504 for a request that ran past the deadline the router set and 500 for any
+// other storage failure.
 func writeStorageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, models.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, models.ErrInvalidMetric):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, context.DeadlineExceeded):
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
 	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

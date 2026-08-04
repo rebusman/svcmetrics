@@ -49,7 +49,7 @@ func postgresDSN(t *testing.T) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
 
-		pgContainer, pgErr = postgres.Run(ctx, "postgres:16-alpine",
+		pgContainer, pgErr = postgres.Run(ctx, "postgres:16.4-alpine",
 			postgres.WithDatabase("metrics"),
 			postgres.WithUsername("metrics"),
 			postgres.WithPassword("secret"),

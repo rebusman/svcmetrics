@@ -166,3 +166,57 @@ func TestDefaultIntervalsFollowTheIncrement(t *testing.T) {
 		}
 	}
 }
+
+// TestOnRetryObservesEveryRepetition verifies that the hook fires once per
+// repetition — not for the original attempt and not for the final failure —
+// and receives the error and the one-based attempt number.
+func TestOnRetryObservesEveryRepetition(t *testing.T) {
+	var (
+		calls    int
+		observed []int
+	)
+
+	cfg := Config{
+		Intervals: []time.Duration{time.Millisecond, time.Millisecond},
+		OnRetry: func(err error, attempt int, pause time.Duration) {
+			if !errors.Is(err, errBoom) {
+				t.Errorf("OnRetry error = %v, want errBoom", err)
+			}
+			if pause < time.Millisecond {
+				t.Errorf("OnRetry pause = %v, want at least the interval", pause)
+			}
+			observed = append(observed, attempt)
+		},
+	}
+
+	err := Do(context.Background(), cfg, func(context.Context) error {
+		calls++
+		return errBoom
+	})
+
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Do() error = %v, want errBoom", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+	if len(observed) != 2 || observed[0] != 1 || observed[1] != 2 {
+		t.Fatalf("observed attempts = %v, want [1 2]", observed)
+	}
+}
+
+// TestWithJitterStaysWithinBounds pins the jitter contract: the pause is never
+// shorter than the interval and never stretches it by more than a quarter.
+func TestWithJitterStaysWithinBounds(t *testing.T) {
+	const d = 4 * time.Second
+	for range 1000 {
+		got := withJitter(d)
+		if got < d || got > d+d/4 {
+			t.Fatalf("withJitter(%v) = %v, want within [%v, %v]", d, got, d, d+d/4)
+		}
+	}
+
+	if got := withJitter(0); got != 0 {
+		t.Fatalf("withJitter(0) = %v, want 0", got)
+	}
+}

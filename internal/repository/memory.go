@@ -34,6 +34,12 @@ func NewMemStorage() *MemStorage {
 	}
 }
 
+// SetOnRetry installs fn as the observer of the repeated snapshot file
+// operations, so the caller can log the failures the storage recovers from.
+func (s *MemStorage) SetOnRetry(fn retry.OnRetry) {
+	s.retry.OnRetry = fn
+}
+
 // UpdateGauge stores value under name and returns it.
 func (s *MemStorage) UpdateGauge(_ context.Context, name string, value float64) (float64, error) {
 	s.mu.Lock()
@@ -139,9 +145,10 @@ func (s *MemStorage) snapshot() []models.Metrics {
 // file next to the target, which then replaces it by a rename. A write that
 // fails for a passing reason — the target held open by another process, a busy
 // device — is repeated; each attempt starts from its own temporary file, so a
-// half-written one is never promoted.
-func (s *MemStorage) Save(path string) error {
-	return retry.Do(context.Background(), s.retry, func(context.Context) error {
+// half-written one is never promoted. A cancelled ctx ends the retrying at
+// once, so a shutdown is never held up by the pauses between the attempts.
+func (s *MemStorage) Save(ctx context.Context, path string) error {
+	return retry.Do(ctx, s.retry, func(context.Context) error {
 		return s.save(path)
 	})
 }
@@ -193,10 +200,18 @@ func writeAndClose(f *os.File, data []byte) error {
 }
 
 // Load restores metrics from a snapshot written by Save, merging them into
-// whatever the storage already holds. A read that fails for a passing reason is
-// repeated; a missing or malformed snapshot is reported at once.
-func (s *MemStorage) Load(path string) error {
-	data, err := retry.DoValue(context.Background(), s.retry, func(context.Context) ([]byte, error) {
+// whatever the storage already holds: a gauge takes the snapshot value, a
+// counter adds its delta to the running total, matching what UpdateBatch
+// would do with the same metrics. A read that fails for a passing reason is
+// repeated, and a cancelled ctx ends the retrying at once; a missing or
+// malformed snapshot is reported immediately.
+//
+// Entries with an unknown type or without a value are skipped: the valid rest
+// of the snapshot is still loaded, and the skips are reported as an error
+// wrapping models.ErrInvalidMetric, so the caller can tell a partial restore
+// from a complete one.
+func (s *MemStorage) Load(ctx context.Context, path string) error {
+	data, err := retry.DoValue(ctx, s.retry, func(context.Context) ([]byte, error) {
 		return os.ReadFile(path)
 	})
 	if err != nil {
@@ -211,18 +226,20 @@ func (s *MemStorage) Load(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	skipped := 0
 	for _, m := range metrics {
-		switch m.MType {
-		case models.Gauge:
-			if m.Value != nil {
-				s.gauges[m.ID] = *m.Value
-			}
-		case models.Counter:
-			if m.Delta != nil {
-				s.counters[m.ID] = *m.Delta
-			}
+		switch {
+		case m.MType == models.Gauge && m.Value != nil:
+			s.gauges[m.ID] = *m.Value
+		case m.MType == models.Counter && m.Delta != nil:
+			s.counters[m.ID] += *m.Delta
+		default:
+			skipped++
 		}
 	}
 
+	if skipped > 0 {
+		return fmt.Errorf("snapshot %s: skipped %d entries: %w", path, skipped, models.ErrInvalidMetric)
+	}
 	return nil
 }

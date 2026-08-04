@@ -98,6 +98,12 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 	}
 }
 
+// SetOnRetry installs fn as the observer of the repeated reports, so the
+// caller can log the failures the agent recovers from.
+func (a *Agent) SetOnRetry(fn retry.OnRetry) {
+	a.retry.OnRetry = fn
+}
+
 // Run collects and reports metrics until the context is cancelled.
 func (a *Agent) Run(ctx context.Context) {
 	pollTicker := time.NewTicker(a.pollInterval)

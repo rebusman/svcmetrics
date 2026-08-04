@@ -81,19 +81,27 @@ func isRetriablePgCode(code string) bool {
 
 // isRetriableFileError reports whether a failed snapshot read or write may
 // succeed on a second try. A file operation that failed because the path is
-// wrong, forbidden or out of space is permanent, and a malformed snapshot is
-// not a file error at all; the rest — a file another process holds open, a
-// device that is busy — usually clears within seconds.
+// wrong, forbidden, a directory, on a read-only mount or out of space is
+// permanent, and a malformed snapshot is not a file error at all; the rest — a
+// file another process holds open, a device that is busy — usually clears
+// within seconds.
 func isRetriableFileError(err error) bool {
 	if err == nil {
 		return false
 	}
 
+	// The permanent failures are matched by their portable errno rather than by
+	// the message, which differs between the platforms: Windows synthesises the
+	// same values for its own error codes, so EISDIR here covers both "is a
+	// directory" on Unix and ERROR_DIRECTORY on Windows.
 	switch {
 	case errors.Is(err, fs.ErrNotExist),
 		errors.Is(err, fs.ErrPermission),
 		errors.Is(err, fs.ErrInvalid),
-		errors.Is(err, syscall.ENOSPC):
+		errors.Is(err, syscall.ENOSPC),
+		errors.Is(err, syscall.EISDIR),
+		errors.Is(err, syscall.ENOTDIR),
+		errors.Is(err, syscall.EROFS):
 		return false
 	}
 
