@@ -2,6 +2,7 @@
 
 // The tests in this file need Docker: they run PostgreSQL in a throwaway
 // container through testcontainers. Run them with -tags integration.
+
 package repository
 
 import (
@@ -276,9 +277,7 @@ func TestPgStorageConcurrentCounterUpdatesAreAtomic(t *testing.T) {
 		errsGot []error
 	)
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			got, err := s.UpdateCounter(ctx, name, 1)
 			mu.Lock()
 			defer mu.Unlock()
@@ -287,7 +286,7 @@ func TestPgStorageConcurrentCounterUpdatesAreAtomic(t *testing.T) {
 				return
 			}
 			seen[got]++
-		}()
+		})
 	}
 	wg.Wait()
 

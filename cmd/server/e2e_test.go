@@ -451,10 +451,7 @@ func TestE2EConcurrentCounterUpdatesArePersistedExactly(t *testing.T) {
 		failures []error
 	)
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			resp, err := client.Post(srv.URL+"/update", "application/json", bytes.NewReader(body))
 			if err != nil {
 				mu.Lock()
@@ -478,7 +475,7 @@ func TestE2EConcurrentCounterUpdatesArePersistedExactly(t *testing.T) {
 				return
 			}
 			totals[*echoed.Delta]++
-		}()
+		})
 	}
 	wg.Wait()
 

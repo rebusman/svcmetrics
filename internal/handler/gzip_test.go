@@ -334,7 +334,7 @@ func TestGzipResponseMiddlewareSetsVaryHeader(t *testing.T) {
 	vary := rec.Header().Values("Vary")
 	found := false
 	for _, v := range vary {
-		for _, part := range strings.Split(v, ",") {
+		for part := range strings.SplitSeq(v, ",") {
 			if strings.TrimSpace(part) == "Accept-Encoding" {
 				found = true
 				break

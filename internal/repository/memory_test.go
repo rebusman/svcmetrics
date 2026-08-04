@@ -439,9 +439,7 @@ func TestMemStorageUpdateBatchIsAtomicForReaders(t *testing.T) {
 	names := []string{"A", "B", "C", "D"}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 1; i <= rounds; i++ {
 			batch := make([]models.Metrics, 0, len(names))
 			for _, name := range names {
@@ -452,7 +450,7 @@ func TestMemStorageUpdateBatchIsAtomicForReaders(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	var mismatches int
 	for range rounds * 10 {
@@ -496,16 +494,14 @@ func TestMemStorageUpdateBatchConcurrentCounters(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range rounds {
 				if err := s.UpdateBatch(ctx, []models.Metrics{counter("PollCount", 1)}); err != nil {
 					t.Errorf("UpdateBatch error = %v", err)
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

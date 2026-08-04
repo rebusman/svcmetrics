@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
 
 	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/retry"
 )
 
 // MemStorage keeps metrics in memory and can persist them to a JSON file.
@@ -17,6 +19,10 @@ type MemStorage struct {
 	mu       sync.RWMutex
 	gauges   map[string]float64
 	counters map[string]int64
+
+	// retry governs the snapshot file operations only: the in-memory ones
+	// cannot fail in a way a repetition would fix.
+	retry retry.Config
 }
 
 // NewMemStorage returns an empty in-memory storage.
@@ -24,6 +30,7 @@ func NewMemStorage() *MemStorage {
 	return &MemStorage{
 		gauges:   make(map[string]float64),
 		counters: make(map[string]int64),
+		retry:    retry.Config{Retriable: isRetriableFileError},
 	}
 }
 
@@ -97,9 +104,7 @@ func (s *MemStorage) GetAllGauges(_ context.Context) (map[string]float64, error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	res := make(map[string]float64, len(s.gauges))
-	for k, v := range s.gauges {
-		res[k] = v
-	}
+	maps.Copy(res, s.gauges)
 	return res, nil
 }
 
@@ -108,9 +113,7 @@ func (s *MemStorage) GetAllCounters(_ context.Context) (map[string]int64, error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	res := make(map[string]int64, len(s.counters))
-	for k, v := range s.counters {
-		res[k] = v
-	}
+	maps.Copy(res, s.counters)
 	return res, nil
 
 }
@@ -133,8 +136,18 @@ func (s *MemStorage) snapshot() []models.Metrics {
 }
 
 // Save writes a snapshot to path atomically: the data lands in a temporary
-// file next to the target, which then replaces it by a rename.
+// file next to the target, which then replaces it by a rename. A write that
+// fails for a passing reason — the target held open by another process, a busy
+// device — is repeated; each attempt starts from its own temporary file, so a
+// half-written one is never promoted.
 func (s *MemStorage) Save(path string) error {
+	return retry.Do(context.Background(), s.retry, func(context.Context) error {
+		return s.save(path)
+	})
+}
+
+// save writes one snapshot to path.
+func (s *MemStorage) save(path string) error {
 	metrics := s.snapshot()
 
 	data, err := json.MarshalIndent(metrics, "", "  ")
@@ -180,9 +193,12 @@ func writeAndClose(f *os.File, data []byte) error {
 }
 
 // Load restores metrics from a snapshot written by Save, merging them into
-// whatever the storage already holds.
+// whatever the storage already holds. A read that fails for a passing reason is
+// repeated; a missing or malformed snapshot is reported at once.
 func (s *MemStorage) Load(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := retry.DoValue(context.Background(), s.retry, func(context.Context) ([]byte, error) {
+		return os.ReadFile(path)
+	})
 	if err != nil {
 		return err
 	}
