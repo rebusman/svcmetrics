@@ -97,8 +97,8 @@ func UpdateJSONHandler(s repository.Storage) http.HandlerFunc {
 
 // UpdatesJSONHandler handles POST /updates/: a batch of metrics stored in a
 // single atomic write. An empty batch is accepted as a no-op, a malformed one
-// is rejected in full with 400. The single-metric endpoints keep working
-// alongside it.
+// (including a bare null instead of an array) is rejected in full with 400. The
+// single-metric endpoints keep working alongside it.
 func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var batch []models.Metrics
@@ -108,6 +108,14 @@ func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
 			} else {
 				http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			}
+			return
+		}
+
+		// json.Decode accepts a bare null into a slice, leaving it nil: the
+		// endpoint contract is a JSON array, so such a body is rejected. An
+		// empty array [] decodes to a non-nil slice and stays valid.
+		if batch == nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
 
