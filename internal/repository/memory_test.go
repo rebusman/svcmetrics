@@ -225,10 +225,10 @@ func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	}
 }
 
-// TestMemStorageLoadMergesCounters verifies that loading a snapshot into a
-// non-empty storage adds the snapshot deltas to the running totals instead of
-// overwriting them, mirroring what UpdateBatch would do.
-func TestMemStorageLoadMergesCounters(t *testing.T) {
+// TestMemStorageLoadOverwritesCounters verifies that loading a snapshot
+// overwrites the current counter values with the absolute totals stored in the
+// snapshot, regardless of what the storage held before.
+func TestMemStorageLoadOverwritesCounters(t *testing.T) {
 	ctx := context.Background()
 
 	saved := NewMemStorage()
@@ -248,11 +248,43 @@ func TestMemStorageLoadMergesCounters(t *testing.T) {
 		t.Fatalf("Load error = %v", err)
 	}
 
-	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 12 {
-		t.Fatalf("counter after Load = %d, err = %v, want 12 (7+5)", got, err)
+	// Counter must be the snapshot value (5), not 7+5=12.
+	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 5 {
+		t.Fatalf("counter after Load = %d, err = %v, want 5 (snapshot value)", got, err)
 	}
+	// Gauge is also overwritten by the snapshot value.
 	if got, err := s.GetGauge(ctx, "Alloc"); err != nil || got != 1.5 {
-		t.Fatalf("gauge after Load = %v, err = %v, want the snapshot value 1.5", got, err)
+		t.Fatalf("gauge after Load = %v, err = %v, want 1.5 (snapshot value)", got, err)
+	}
+}
+
+// TestMemStorageLoadIsIdempotent verifies that calling Load twice on the same
+// snapshot produces the same result as calling it once: counters must not
+// double-count.
+func TestMemStorageLoadIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	saved := NewMemStorage()
+	_, _ = saved.UpdateCounter(ctx, "PollCount", 42)
+	_, _ = saved.UpdateGauge(ctx, "Alloc", 3.14)
+
+	path := filepath.Join(t.TempDir(), "metrics.json")
+	if err := saved.Save(ctx, path); err != nil {
+		t.Fatalf("Save error = %v", err)
+	}
+
+	s := NewMemStorage()
+	for i := range 3 {
+		if err := s.Load(ctx, path); err != nil {
+			t.Fatalf("Load #%d error = %v", i+1, err)
+		}
+	}
+
+	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 42 {
+		t.Fatalf("counter after 3x Load = %d, err = %v, want 42", got, err)
+	}
+	if got, err := s.GetGauge(ctx, "Alloc"); err != nil || got != 3.14 {
+		t.Fatalf("gauge after 3x Load = %v, err = %v, want 3.14", got, err)
 	}
 }
 

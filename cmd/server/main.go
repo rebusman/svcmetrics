@@ -166,12 +166,15 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 
 // main reads the settings, picks a storage — PostgreSQL, then a file-backed
 // in-memory one, then plain memory — and serves until the process is asked to
-// stop. The final snapshot is written here rather than in the saver goroutine,
-// so the process cannot exit while that write is still in flight.
+
+// stop. Persistence to a file is opt-in: without -f or FILE_STORAGE_PATH the
+// metrics stay in memory and nothing is written to disk. The final snapshot is
+// written here rather than in the saver goroutine, so the process cannot exit
+// while that write is still in flight.
 func main() {
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	storeInterval := flag.Int("i", 300, "save interval in seconds")
-	fileStoragePath := flag.String("f", "metrics_storage.json", "path to storage file")
+	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
 	flag.Parse()

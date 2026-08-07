@@ -199,10 +199,10 @@ func writeAndClose(f *os.File, data []byte) error {
 	return f.Close()
 }
 
-// Load restores metrics from a snapshot written by Save, merging them into
-// whatever the storage already holds: a gauge takes the snapshot value, a
-// counter adds its delta to the running total, matching what UpdateBatch
-// would do with the same metrics. A read that fails for a passing reason is
+// Load restores metrics from a snapshot written by Save, overwriting whatever
+// the storage already holds: a gauge takes the snapshot value, a counter is
+// set to the absolute value stored in the snapshot (which is the running total
+// at the time Save was called). A read that fails for a passing reason is
 // repeated, and a cancelled ctx ends the retrying at once; a missing or
 // malformed snapshot is reported immediately.
 //
@@ -232,7 +232,7 @@ func (s *MemStorage) Load(ctx context.Context, path string) error {
 		case m.MType == models.Gauge && m.Value != nil:
 			s.gauges[m.ID] = *m.Value
 		case m.MType == models.Counter && m.Delta != nil:
-			s.counters[m.ID] += *m.Delta
+			s.counters[m.ID] = *m.Delta
 		default:
 			skipped++
 		}
