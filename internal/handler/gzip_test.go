@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -72,7 +73,7 @@ func TestGzipResponseWriterPushNotSupported(t *testing.T) {
 	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gzip.NewWriter(bytes.NewBuffer(nil))}
 
 	err := grw.Push("/asset.js", nil)
-	if err != http.ErrNotSupported {
+	if !errors.Is(err, http.ErrNotSupported) {
 		t.Fatalf("Push error = %v, want %v", err, http.ErrNotSupported)
 	}
 }
