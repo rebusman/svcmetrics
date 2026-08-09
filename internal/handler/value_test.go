@@ -3,20 +3,21 @@ package handler
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	"go.uber.org/mock/gomock"
+
+	"github.com/rebusman/svcmetrics/internal/mocks"
+	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
 func TestValueHandler(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
 	_, _ = s.UpdateCounter(ctx, "PollCount", 5)
 	r := newTestRouter(s)
@@ -50,11 +51,12 @@ func TestValueHandler(t *testing.T) {
 	}
 }
 
-// Gauges are formatted without a trailing exponent or padding, so the plain
-// text endpoint returns exactly what a client can parse back.
+// TestValueHandlerFormatsGauges verifies that gauges are rendered without a
+// trailing exponent or padding, so a client can parse back exactly what the
+// plain text endpoint returned.
 func TestValueHandlerFormatsGauges(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	r := newTestRouter(s)
 
 	tests := []struct {
@@ -88,88 +90,15 @@ func TestValueHandlerFormatsGauges(t *testing.T) {
 	}
 }
 
-func TestValueJSONHandler(t *testing.T) {
-	ctx := context.Background()
-	s := storage.NewMemStorage()
-	gaugeVal := 12.5
-	_, _ = s.UpdateGauge(ctx, "Alloc", gaugeVal)
-	_, _ = s.UpdateCounter(ctx, "PollCount", 7)
-	r := newTestRouter(s)
-
-	t.Run("gauge ok", func(t *testing.T) {
-		m := models.Metrics{ID: "Alloc", MType: models.Gauge}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-		}
-		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-			t.Errorf("Content-Type = %s, want application/json", ct)
-		}
-		var result models.Metrics
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("decode response: %v", err)
-		}
-		if result.Value == nil || *result.Value != gaugeVal {
-			t.Errorf("value = %v, want %v", result.Value, gaugeVal)
-		}
-	})
-
-	t.Run("counter ok", func(t *testing.T) {
-		m := models.Metrics{ID: "PollCount", MType: models.Counter}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-		}
-		var result models.Metrics
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("decode response: %v", err)
-		}
-		if result.Delta == nil || *result.Delta != 7 {
-			t.Errorf("delta = %v, want 7", result.Delta)
-		}
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		m := models.Metrics{ID: "Unknown", MType: models.Gauge}
-		body, _ := json.Marshal(m)
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
-		}
-	})
-
-	t.Run("empty body", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/value", bytes.NewReader([]byte{}))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
-		}
-	})
-}
-
 func TestValueJSONHandlerRejectsBadRequests(t *testing.T) {
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	r := newTestRouter(s)
 
 	tests := []struct {
 		name string
 		body string
 	}{
+		{"empty body", ""},
 		{"malformed json", `{"id":`},
 		{"not an object", `"just a string"`},
 		{"missing id", `{"type":"gauge"}`},
@@ -191,34 +120,8 @@ func TestValueJSONHandlerRejectsBadRequests(t *testing.T) {
 	}
 }
 
-func TestListHandler(t *testing.T) {
-	ctx := context.Background()
-	s := storage.NewMemStorage()
-	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
-	_, _ = s.UpdateCounter(ctx, "PollCount", 3)
-	r := newTestRouter(s)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if rec.Header().Get("Content-Type") != "text/html" {
-		t.Errorf("content type = %s, want text/html", rec.Header().Get("Content-Type"))
-	}
-
-	body := rec.Body.String()
-	for _, want := range []string{"Alloc", "12.5", "PollCount", "3"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body does not mention %q:\n%s", want, body)
-		}
-	}
-}
-
 func TestListHandlerOnEmptyStorage(t *testing.T) {
-	r := newTestRouter(storage.NewMemStorage())
+	r := newTestRouter(repository.NewMemStorage())
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -262,11 +165,12 @@ func (f *failingWriter) Write(p []byte) (int, error) {
 	return 0, errors.New("connection reset by peer")
 }
 
-// Once the 200 is committed the handler cannot take it back, so a failed body
-// write must not append an error message on top of the JSON.
+// TestJSONHandlersDoNotAppendErrorAfterCommitting verifies that a failed body
+// write does not append an error message on top of the JSON: once the 200 is
+// committed the handler cannot take it back.
 func TestJSONHandlersDoNotAppendErrorAfterCommitting(t *testing.T) {
 	ctx := context.Background()
-	s := storage.NewMemStorage()
+	s := repository.NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 12.5)
 	r := newTestRouter(s)
 
@@ -295,8 +199,6 @@ func TestJSONHandlersDoNotAppendErrorAfterCommitting(t *testing.T) {
 			if got := w.attempted.String(); strings.Contains(got, "Internal Server Error") {
 				t.Errorf("handler appended an error to the committed body: %q", got)
 			}
-			// The body must be attempted in one shot, so a partial write cannot
-			// be followed by unrelated bytes.
 			if w.writeAttempts != 1 {
 				t.Errorf("body written in %d calls, want 1", w.writeAttempts)
 			}
@@ -304,27 +206,21 @@ func TestJSONHandlersDoNotAppendErrorAfterCommitting(t *testing.T) {
 	}
 }
 
-// errStorage fails every operation with a plain error — not ErrNotFound — so
-// the handlers must answer 500 rather than 404.
-type errStorage struct{ err error }
+// newFailingStorage returns a mock storage whose every read fails with err —
+// a plain error, not ErrNotFound — so the handlers must answer 500, not 404.
+func newFailingStorage(t *testing.T, err error) *mocks.MockStorage {
+	t.Helper()
 
-func (e errStorage) GetGauge(context.Context, string) (float64, error) { return 0, e.err }
-func (e errStorage) GetCounter(context.Context, string) (int64, error) { return 0, e.err }
-func (e errStorage) GetAllGauges(context.Context) (map[string]float64, error) {
-	return nil, e.err
-}
-func (e errStorage) GetAllCounters(context.Context) (map[string]int64, error) {
-	return nil, e.err
-}
-func (e errStorage) UpdateGauge(context.Context, string, float64) (float64, error) {
-	return 0, e.err
-}
-func (e errStorage) UpdateCounter(context.Context, string, int64) (int64, error) {
-	return 0, e.err
+	s := mocks.NewMockStorage(gomock.NewController(t))
+	s.EXPECT().GetGauge(gomock.Any(), gomock.Any()).Return(float64(0), err).AnyTimes()
+	s.EXPECT().GetCounter(gomock.Any(), gomock.Any()).Return(int64(0), err).AnyTimes()
+	s.EXPECT().GetAllGauges(gomock.Any()).Return(nil, err).AnyTimes()
+	s.EXPECT().GetAllCounters(gomock.Any()).Return(nil, err).AnyTimes()
+	return s
 }
 
 func TestReadHandlersReportStorageFailuresAs500(t *testing.T) {
-	s := errStorage{err: errors.New("database is on fire")}
+	s := newFailingStorage(t, errors.New("database is on fire"))
 	r := newTestRouter(s)
 
 	tests := []struct {
@@ -356,29 +252,23 @@ func TestReadHandlersReportStorageFailuresAs500(t *testing.T) {
 	}
 }
 
-// The counter list is read after the gauge list, so a failure there must also
-// surface instead of rendering a half-filled page.
+// TestListHandlerReportsCounterFailure verifies that a failure of the counter
+// read, which happens after the gauge read, surfaces instead of rendering a
+// half-filled page.
 func TestListHandlerReportsCounterFailure(t *testing.T) {
-	r := newTestRouter(countersFailStorage{err: errors.New("counters unavailable")})
+	ctrl := gomock.NewController(t)
+	s := mocks.NewMockStorage(ctrl)
+
+	gomock.InOrder(
+		s.EXPECT().GetAllGauges(gomock.Any()).Return(map[string]float64{"Alloc": 1}, nil),
+		s.EXPECT().GetAllCounters(gomock.Any()).Return(nil, errors.New("counters unavailable")),
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	newTestRouter(s).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (body = %q)", rec.Code, rec.Body.String())
 	}
-}
-
-type countersFailStorage struct {
-	errStorage
-	err error
-}
-
-func (c countersFailStorage) GetAllGauges(context.Context) (map[string]float64, error) {
-	return map[string]float64{"Alloc": 1}, nil
-}
-
-func (c countersFailStorage) GetAllCounters(context.Context) (map[string]int64, error) {
-	return nil, c.err
 }

@@ -41,6 +41,8 @@ type hijackableRecorder struct {
 	hijackErr error
 	hijacked  bool
 	flushed   bool
+	pushed    string
+	pushErr   error
 }
 
 func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -56,8 +58,14 @@ func (h *hijackableRecorder) Flush() {
 	h.ResponseRecorder.Flush()
 }
 
-// Wrapping a ResponseWriter hides the optional interfaces it implements, so
-// the wrapper has to forward them explicitly.
+func (h *hijackableRecorder) Push(target string, _ *http.PushOptions) error {
+	h.pushed = target
+	return h.pushErr
+}
+
+// TestResponseWriterForwardsOptionalInterfaces verifies that the wrapper
+// forwards Flush and Hijack explicitly: wrapping a ResponseWriter hides the
+// optional interfaces it implements.
 func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
@@ -72,6 +80,16 @@ func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	if _, ok := any(rw).(http.Hijacker); !ok {
 		t.Fatal("responseWriter does not implement http.Hijacker")
 	}
+	if _, ok := any(rw).(http.Pusher); !ok {
+		t.Fatal("responseWriter does not implement http.Pusher")
+	}
+
+	if err := rw.Push("/asset.js", nil); err != nil {
+		t.Fatalf("Push error = %v", err)
+	}
+	if inner.pushed != "/asset.js" {
+		t.Errorf("Push reached the underlying ResponseWriter with %q, want /asset.js", inner.pushed)
+	}
 
 	rw.Flush()
 	if !inner.flushed {
@@ -85,8 +103,6 @@ func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	if !inner.hijacked {
 		t.Error("Hijack did not reach the underlying ResponseWriter")
 	}
-	// The caller must get the real connection, not a copy or nil — hijacking
-	// is pointless otherwise.
 	if conn != serverConn {
 		t.Errorf("Hijack returned %v, want the underlying connection", conn)
 	}
@@ -95,8 +111,31 @@ func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	}
 }
 
-// A hijack that fails downstream must surface unchanged, so the caller can
-// tell a real failure from an unsupported writer.
+// TestResponseWriterPushPropagatesError verifies that a push failing downstream
+// surfaces unchanged rather than being reported as unsupported.
+func TestResponseWriterPushPropagatesError(t *testing.T) {
+	wantErr := errors.New("stream closed")
+	inner := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), pushErr: wantErr}
+	rw := &responseWriter{ResponseWriter: inner, statusCode: http.StatusOK}
+
+	if err := rw.Push("/asset.js", nil); !errors.Is(err, wantErr) {
+		t.Fatalf("Push error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestResponseWriterPushWithoutSupport verifies that a writer that cannot push
+// is reported as such instead of panicking on the type assertion.
+func TestResponseWriterPushWithoutSupport(t *testing.T) {
+	rw := &responseWriter{ResponseWriter: httptest.NewRecorder(), statusCode: http.StatusOK}
+
+	if err := rw.Push("/asset.js", nil); !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("Push error = %v, want %v", err, http.ErrNotSupported)
+	}
+}
+
+// TestResponseWriterHijackPropagatesError verifies that a hijack failing
+// downstream surfaces unchanged, so the caller can tell a real failure from an
+// unsupported writer.
 func TestResponseWriterHijackPropagatesError(t *testing.T) {
 	wantErr := errors.New("connection already hijacked")
 	inner := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), hijackErr: wantErr}
@@ -111,8 +150,8 @@ func TestResponseWriterHijackPropagatesError(t *testing.T) {
 	}
 }
 
-// A plain recorder supports neither, and the wrapper must say so rather than
-// panic on the type assertion.
+// TestResponseWriterHijackWithoutSupport verifies that the wrapper reports an
+// unsupported hijack instead of panicking on the type assertion.
 func TestResponseWriterHijackWithoutSupport(t *testing.T) {
 	rw := &responseWriter{ResponseWriter: httptest.NewRecorder(), statusCode: http.StatusOK}
 
@@ -120,7 +159,7 @@ func TestResponseWriterHijackWithoutSupport(t *testing.T) {
 		t.Fatal("Hijack error = nil, want an error for a non-hijackable writer")
 	}
 
-	rw.Flush() // must be a no-op, not a panic
+	rw.Flush()
 }
 
 func newTestLogger() (*logrus.Logger, *bytes.Buffer) {
@@ -132,9 +171,9 @@ func newTestLogger() (*logrus.Logger, *bytes.Buffer) {
 	return log, out
 }
 
-// The handlers cannot report a failed body write themselves, so the wrapper
-// has to surface it here — and at error level, not buried in the usual
-// "Request handled" line.
+// TestLoggingMiddlewareReportsBodyWriteFailure verifies that a failed body
+// write is logged at error level rather than buried in the usual "Request
+// handled" line: the handlers cannot report it themselves.
 func TestLoggingMiddlewareReportsBodyWriteFailure(t *testing.T) {
 	log, out := newTestLogger()
 
@@ -191,8 +230,8 @@ func TestLoggingMiddlewareLogsSuccessfulRequest(t *testing.T) {
 	}
 }
 
-// The status code has to survive the wrapper, otherwise the log would claim
-// 200 for every response.
+// TestLoggingMiddlewareRecordsStatusCode verifies that the status code survives
+// the wrapper, otherwise the log would claim 200 for every response.
 func TestLoggingMiddlewareRecordsStatusCode(t *testing.T) {
 	log, out := newTestLogger()
 

@@ -6,10 +6,16 @@ import (
 	"time"
 )
 
+//go:generate go tool mockgen -destination=../mocks/pinger.go -package=mocks github.com/rebusman/svcmetrics/internal/handler Pinger
+
+// Pinger reports whether the backing database is reachable. Only the
+// PostgreSQL storage implements it.
 type Pinger interface {
 	PingContext(ctx context.Context) error
 }
 
+// PingHandler handles GET /ping. It answers 500 when no database is configured
+// or when the ping fails.
 func PingHandler(p Pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)

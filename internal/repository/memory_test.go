@@ -1,4 +1,4 @@
-package storage
+package repository
 
 import (
 	"context"
@@ -131,7 +131,6 @@ func TestMemStorageGetAllReturnsIndependentCopies(t *testing.T) {
 		t.Fatalf("counters = %v, want {PollCount:8}", counters)
 	}
 
-	// The returned maps are snapshots: mutating them must not reach the store.
 	gauges["Alloc"] = 999
 	counters["PollCount"] = 999
 
@@ -155,7 +154,6 @@ func TestMemStorageGetAllOnEmptyStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAllCounters error = %v", err)
 	}
-	// Non-nil empty maps, so callers can range over them without a nil check.
 	if gauges == nil || len(gauges) != 0 {
 		t.Fatalf("gauges = %v, want empty non-nil map", gauges)
 	}
@@ -195,8 +193,8 @@ func TestMemStorageLoadErrors(t *testing.T) {
 	})
 }
 
-// Entries without a value carry no data, so Load must skip them rather than
-// record a zero.
+// TestMemStorageLoadSkipsEntriesWithoutValues verifies that entries carrying no
+// data are skipped rather than recorded as a zero.
 func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "partial.json")
@@ -225,7 +223,8 @@ func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	}
 }
 
-// Run with -race: the handlers hit one MemStorage from many request goroutines.
+// TestMemStorageConcurrentAccess hits one MemStorage from many goroutines, the
+// way the handlers do. Run it with -race.
 func TestMemStorageConcurrentAccess(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemStorage()
@@ -259,8 +258,9 @@ func TestMemStorageConcurrentAccess(t *testing.T) {
 	}
 }
 
-// Save writes through a temporary file, so repeated saves must replace the
-// snapshot in place and leave nothing else behind in the directory.
+// TestMemStorageSaveOverwritesAndLeavesNoTempFiles verifies that repeated saves
+// replace the snapshot in place and leave nothing else in the directory: Save
+// writes through a temporary file.
 func TestMemStorageSaveOverwritesAndLeavesNoTempFiles(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -302,7 +302,8 @@ func TestMemStorageSaveOverwritesAndLeavesNoTempFiles(t *testing.T) {
 	}
 }
 
-// A failed Save must not clobber the snapshot that is already on disk.
+// TestMemStorageSaveFailureKeepsPreviousSnapshot verifies that a failed Save
+// does not clobber the snapshot already on disk.
 func TestMemStorageSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -318,8 +319,6 @@ func TestMemStorageSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 		t.Fatalf("ReadFile error = %v", err)
 	}
 
-	// CreateTemp targets the destination directory, so a missing directory
-	// makes Save fail before it can touch the existing file.
 	_, _ = s.UpdateGauge(ctx, "Alloc", 99)
 	if err := s.Save(filepath.Join(dir, "missing", "metrics.json")); err == nil {
 		t.Fatal("Save into a missing directory returned nil, want error")
@@ -334,14 +333,12 @@ func TestMemStorageSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 	}
 }
 
-// When the rename itself fails, Save must report it and still clean up the
-// temporary file it created.
+// TestMemStorageSaveCleansUpWhenRenameFails verifies that a failing rename is
+// reported and the temporary file is still cleaned up.
 func TestMemStorageSaveCleansUpWhenRenameFails(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	// A directory cannot be replaced by a rename, so this makes the last step
-	// of Save fail after the temporary file is already written.
 	target := filepath.Join(dir, "metrics.json")
 	if err := os.Mkdir(target, 0755); err != nil {
 		t.Fatalf("Mkdir error = %v", err)
@@ -375,9 +372,148 @@ func TestWriteAndCloseReportsWriteError(t *testing.T) {
 		t.Fatalf("Close error = %v", err)
 	}
 
-	// Writing to an already closed file fails, and writeAndClose must pass
-	// that error up rather than report a successful save.
 	if err := writeAndClose(f, []byte("payload")); err == nil {
 		t.Fatal("writeAndClose on a closed file returned nil, want error")
+	}
+}
+
+func TestMemStorageUpdateBatch(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStorage()
+
+	if _, err := s.UpdateCounter(ctx, "PollCount", 10); err != nil {
+		t.Fatalf("UpdateCounter error = %v", err)
+	}
+
+	err := s.UpdateBatch(ctx, []models.Metrics{
+		gauge("Alloc", 1.5),
+		counter("PollCount", 5),
+		gauge("Alloc", 2.5),
+		counter("PollCount", 2),
+	})
+	if err != nil {
+		t.Fatalf("UpdateBatch error = %v", err)
+	}
+
+	if got, err := s.GetGauge(ctx, "Alloc"); err != nil || got != 2.5 {
+		t.Errorf("Alloc = %v (err %v), want the last value 2.5", got, err)
+	}
+	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 17 {
+		t.Errorf("PollCount = %v (err %v), want 17 (10+5+2)", got, err)
+	}
+}
+
+func TestMemStorageUpdateBatchEmpty(t *testing.T) {
+	if err := NewMemStorage().UpdateBatch(context.Background(), nil); err != nil {
+		t.Fatalf("UpdateBatch(nil) error = %v", err)
+	}
+}
+
+// TestMemStorageUpdateBatchIsAllOrNothing verifies that a batch which cannot be
+// applied in full is not applied at all.
+func TestMemStorageUpdateBatchIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStorage()
+
+	err := s.UpdateBatch(ctx, []models.Metrics{
+		gauge("Alloc", 1.5),
+		{ID: "Broken", MType: "histogram"},
+	})
+	if !errors.Is(err, models.ErrInvalidMetric) {
+		t.Fatalf("UpdateBatch error = %v, want ErrInvalidMetric", err)
+	}
+
+	if _, err := s.GetGauge(ctx, "Alloc"); !errors.Is(err, models.ErrNotFound) {
+		t.Fatalf("Alloc error = %v, want ErrNotFound — the batch was rejected", err)
+	}
+}
+
+// TestMemStorageUpdateBatchIsAtomicForReaders verifies that readers never
+// observe a partially applied batch: the whole batch is written under one
+// lock.
+func TestMemStorageUpdateBatchIsAtomicForReaders(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStorage()
+
+	const rounds = 200
+	names := []string{"A", "B", "C", "D"}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= rounds; i++ {
+			batch := make([]models.Metrics, 0, len(names))
+			for _, name := range names {
+				batch = append(batch, gauge(name, float64(i)))
+			}
+			if err := s.UpdateBatch(ctx, batch); err != nil {
+				t.Errorf("UpdateBatch error = %v", err)
+				return
+			}
+		}
+	}()
+
+	var mismatches int
+	for range rounds * 10 {
+		gauges, err := s.GetAllGauges(ctx)
+		if err != nil {
+			t.Fatalf("GetAllGauges error = %v", err)
+		}
+		if len(gauges) == 0 {
+			continue
+		}
+		if len(gauges) != len(names) {
+			mismatches++
+			continue
+		}
+		first := gauges[names[0]]
+		for _, name := range names[1:] {
+			if gauges[name] != first {
+				mismatches++
+				break
+			}
+		}
+	}
+
+	wg.Wait()
+
+	if mismatches != 0 {
+		t.Fatalf("observed %d partially applied batches, want 0", mismatches)
+	}
+}
+
+// TestMemStorageUpdateBatchConcurrentCounters verifies that concurrent batches
+// lose no counter increments.
+func TestMemStorageUpdateBatchConcurrentCounters(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStorage()
+
+	const (
+		writers = 8
+		rounds  = 100
+	)
+
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				if err := s.UpdateBatch(ctx, []models.Metrics{counter("PollCount", 1)}); err != nil {
+					t.Errorf("UpdateBatch error = %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.GetCounter(ctx, "PollCount")
+	if err != nil {
+		t.Fatalf("GetCounter error = %v", err)
+	}
+	if want := int64(writers * rounds); got != want {
+		t.Fatalf("PollCount = %d, want %d", got, want)
 	}
 }

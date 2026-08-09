@@ -1,23 +1,27 @@
 package handler
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/rebusman/svcmetrics/internal/mocks"
 )
 
-type stubPinger struct {
-	err error
-}
+// newPinger returns a mock Pinger whose PingContext answers with err.
+func newPinger(t *testing.T, err error) *mocks.MockPinger {
+	t.Helper()
 
-func (s stubPinger) PingContext(context.Context) error {
-	return s.err
+	p := mocks.NewMockPinger(gomock.NewController(t))
+	p.EXPECT().PingContext(gomock.Any()).Return(err).Times(1)
+	return p
 }
 
 func TestPingHandlerOK(t *testing.T) {
-	h := PingHandler(stubPinger{})
+	h := PingHandler(newPinger(t, nil))
 
 	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
 	rec := httptest.NewRecorder()
@@ -30,7 +34,7 @@ func TestPingHandlerOK(t *testing.T) {
 }
 
 func TestPingHandlerError(t *testing.T) {
-	h := PingHandler(stubPinger{err: errors.New("connection refused")})
+	h := PingHandler(newPinger(t, errors.New("connection refused")))
 
 	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
 	rec := httptest.NewRecorder()

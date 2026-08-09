@@ -1,3 +1,5 @@
+// Package handler implements the HTTP handlers of the metrics server together
+// with the gzip middleware they rely on.
 package handler
 
 import (
@@ -10,21 +12,26 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
-// writeStorageError replies 404 for a missing metric and 500 for any other
-// storage failure.
+// writeStorageError replies 404 for a missing metric, 400 for a malformed one
+// and 500 for any other storage failure.
 func writeStorageError(w http.ResponseWriter, err error) {
-	if errors.Is(err, models.ErrNotFound) {
+	switch {
+	case errors.Is(err, models.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-		return
+	case errors.Is(err, models.ErrInvalidMetric):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
-// UpdateJSONHandler handles POST /update.
-func UpdateJSONHandler(s storage.Storage) http.HandlerFunc {
+// UpdateJSONHandler handles POST /update: a single metric in JSON. It answers
+// with the stored metric, 400 for a malformed request and 500 for a storage
+// failure.
+func UpdateJSONHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
@@ -76,8 +83,6 @@ func UpdateJSONHandler(s storage.Storage) http.HandlerFunc {
 			return
 		}
 
-		// Same reason as in ValueJSONHandler: commit the response only once the
-		// body is known to be encodable.
 		var payload bytes.Buffer
 		if err := json.NewEncoder(&payload).Encode(result); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -86,14 +91,42 @@ func UpdateJSONHandler(s storage.Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		// Response already committed; the write error is logged by the
-		// ResponseWriter wrapper in cmd/server.
 		_, _ = payload.WriteTo(w)
 	}
 }
 
-// UpdateHandler handles POST /update/{type}/{name}/{value}.
-func UpdateHandler(s storage.Storage) http.HandlerFunc {
+// UpdatesJSONHandler handles POST /updates/: a batch of metrics stored in a
+// single atomic write. An empty batch is accepted as a no-op, a malformed one
+// is rejected in full with 400. The single-metric endpoints keep working
+// alongside it.
+func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var batch []models.Metrics
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			if errors.Is(err, io.EOF) {
+				http.Error(w, "Empty body", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			}
+			return
+		}
+
+		if len(batch) > 0 {
+			if err := s.UpdateBatch(r.Context(), batch); err != nil {
+				writeStorageError(w, err)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}
+}
+
+// UpdateHandler handles POST /update/{type}/{name}/{value}: a single metric
+// passed in the path.
+func UpdateHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		mType := chi.URLParam(r, "type")
 		mName := chi.URLParam(r, "name")

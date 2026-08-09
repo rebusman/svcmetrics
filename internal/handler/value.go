@@ -11,9 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/storage"
+	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
+// listTmpl renders the HTML page served by ListHandler.
 var listTmpl = template.Must(template.New("metrics").Parse(`
 <html>
 <head><title>Metrics</title></head>
@@ -34,8 +35,9 @@ var listTmpl = template.Must(template.New("metrics").Parse(`
 </body>
 </html>`))
 
-// ValueJSONHandler handles POST /value.
-func ValueJSONHandler(s storage.Storage) http.HandlerFunc {
+// ValueJSONHandler handles POST /value: a metric lookup by ID and type,
+// answered in JSON. It replies 404 when the metric is unknown.
+func ValueJSONHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
@@ -78,9 +80,6 @@ func ValueJSONHandler(s storage.Storage) http.HandlerFunc {
 			return
 		}
 
-		// Encode before committing the response: once the status line is out,
-		// http.Error can no longer change it and would only append its message
-		// to the JSON body.
 		var payload bytes.Buffer
 		if err := json.NewEncoder(&payload).Encode(result); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -89,15 +88,13 @@ func ValueJSONHandler(s storage.Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		// A failed write here means the client is gone: the status line has
-		// shipped, so there is nobody left to report an error to. The
-		// ResponseWriter wrapper in cmd/server records it for the request log.
 		_, _ = payload.WriteTo(w)
 	}
 }
 
-// ValueHandler handles GET /value/{type}/{name}.
-func ValueHandler(s storage.Storage) http.HandlerFunc {
+// ValueHandler handles GET /value/{type}/{name}: a metric lookup answered as
+// plain text.
+func ValueHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		mType := chi.URLParam(r, "type")
 		mName := chi.URLParam(r, "name")
@@ -127,14 +124,12 @@ func ValueHandler(s storage.Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		// Response already committed; the write error is logged by the
-		// ResponseWriter wrapper in cmd/server.
 		_, _ = w.Write([]byte(value))
 	}
 }
 
-// ListHandler handles GET /.
-func ListHandler(s storage.Storage) http.HandlerFunc {
+// ListHandler handles GET /: an HTML page listing every stored metric.
+func ListHandler(s repository.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -157,8 +152,6 @@ func ListHandler(s storage.Storage) http.HandlerFunc {
 			Counters: counters,
 		}
 
-		// Render into a buffer first: a template that fails halfway through
-		// would otherwise leave a partial page that no error can take back.
 		var page bytes.Buffer
 		if err := listTmpl.Execute(&page, data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -167,8 +160,6 @@ func ListHandler(s storage.Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
-		// Response already committed; the write error is logged by the
-		// ResponseWriter wrapper in cmd/server.
 		_, _ = page.WriteTo(w)
 	}
 }

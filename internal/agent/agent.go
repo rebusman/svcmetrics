@@ -1,3 +1,5 @@
+// Package agent collects runtime metrics and reports them to the metrics
+// server in gzip-compressed batches.
 package agent
 
 import (
@@ -10,50 +12,60 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
+// Defaults applied by New when the caller leaves a setting unset.
 const (
 	defaultServerAddress  = "http://localhost:8080"
 	defaultPollInterval   = 2 * time.Second
 	defaultReportInterval = 10 * time.Second
 	clientTimeout         = 5 * time.Second
 
+	// DefaultBatchSize is how many metrics go into one POST /updates/ request
+	// unless the caller configures something else.
+	DefaultBatchSize = 32
+
 	reportMaxAttempts   = 3
 	reportRetryInterval = 1 * time.Second
 )
 
+// gzipWriterPool recycles the compressors used for the request bodies.
 var gzipWriterPool = sync.Pool{
 	New: func() any {
 		return gzip.NewWriter(nil)
 	},
 }
 
+// metricState is the set of metrics collected so far.
 type metricState struct {
 	gauges   map[string]float64
 	counters map[string]int64
 }
 
+// Agent polls the runtime for metrics and reports them to the server. It is
+// safe for concurrent use.
 type Agent struct {
 	endpoint string
 	client   *http.Client
 
 	pollInterval   time.Duration
 	reportInterval time.Duration
+	batchSize      int
 
 	mu               sync.RWMutex
 	metrics          metricState
 	lastSentCounters map[string]int64
 }
 
-func New(endpoint string, pollInterval, reportInterval time.Duration) *Agent {
+// New returns an agent reporting to endpoint. batchSize caps how many metrics
+// travel in one request; a non-positive value of any setting falls back to its
+// default.
+func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize int) *Agent {
 	if endpoint == "" {
 		endpoint = defaultServerAddress
 	}
@@ -63,12 +75,16 @@ func New(endpoint string, pollInterval, reportInterval time.Duration) *Agent {
 	if reportInterval <= 0 {
 		reportInterval = defaultReportInterval
 	}
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
 
 	return &Agent{
 		endpoint:       strings.TrimRight(endpoint, "/"),
 		client:         &http.Client{Timeout: clientTimeout},
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
+		batchSize:      batchSize,
 		metrics: metricState{
 			gauges:   make(map[string]float64, len(models.GaugeMetricNames)),
 			counters: make(map[string]int64, len(models.CounterMetricNames)),
@@ -97,12 +113,22 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 }
 
-// reportWithRetry sends metrics, retrying on failure up to reportMaxAttempts
-// times with a fixed backoff. It stops early if the context is cancelled.
+// reportWithRetry sends the collected metrics, retrying on failure up to
+// reportMaxAttempts times with a fixed backoff. It stops early if the context
+// is cancelled.
+//
+// The snapshot is taken once and only the batches the server has not accepted
+// are retried: resending an accepted batch would count its counter deltas
+// twice. Deltas that never made it are handed back for the next report.
 func (a *Agent) reportWithRetry(ctx context.Context) {
-	var err error
+	pending := a.collectBatch()
+	if len(pending) == 0 {
+		return
+	}
+
 	for attempt := 1; attempt <= reportMaxAttempts; attempt++ {
-		if err = a.SendMetrics(); err == nil {
+		var err error
+		if pending, err = a.sendBatches(pending); err == nil {
 			return
 		}
 
@@ -112,15 +138,17 @@ func (a *Agent) reportWithRetry(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
+			a.returnCounters(pending)
 			return
 		case <-time.After(reportRetryInterval):
 		}
 	}
 
-	// All attempts failed; keep the agent running and try again on the next tick.
-	_ = err
+	a.returnCounters(pending)
 }
 
+// CollectRuntimeMetrics reads the runtime memory statistics into the agent's
+// state and advances the poll counter.
 func (a *Agent) CollectRuntimeMetrics() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -165,26 +193,72 @@ func (a *Agent) CollectRuntimeMetrics() {
 	a.metrics.counters[models.PollCount]++
 }
 
+// SendMetrics reports everything collected so far as one or more batches.
 func (a *Agent) SendMetrics() error {
-	gauges, counterDeltas := a.snapshotForReport()
+	pending := a.collectBatch()
+	if len(pending) == 0 {
+		return nil
+	}
 
-	var g errgroup.Group
+	unsent, err := a.sendBatches(pending)
+	if err != nil {
+		a.returnCounters(unsent)
+		return err
+	}
+	return nil
+}
 
+// collectBatch turns the current state into a batch, marking the counters as
+// sent. Counters with a zero delta are left out: they carry no information, and
+// dropping them keeps an idle agent from sending anything at all. The batch
+// order is stable from one report to the next.
+func (a *Agent) collectBatch() []models.Metrics {
+	gauges, deltas := a.snapshotForReport()
+
+	batch := make([]models.Metrics, 0, len(gauges)+len(deltas))
 	for _, name := range models.GaugeMetricNames {
-		name := name
-		g.Go(func() error {
-			return a.sendMetric(models.Gauge, name, formatGaugeValue(gauges[name]))
-		})
+		value, ok := gauges[name]
+		if !ok {
+			continue
+		}
+		batch = append(batch, models.Metrics{ID: name, MType: models.Gauge, Value: &value})
 	}
-
 	for _, name := range models.CounterMetricNames {
-		name := name
-		g.Go(func() error {
-			return a.sendMetric(models.Counter, name, strconv.FormatInt(counterDeltas[name], 10))
-		})
+		delta := deltas[name]
+		if delta == 0 {
+			continue
+		}
+		batch = append(batch, models.Metrics{ID: name, MType: models.Counter, Delta: &delta})
 	}
 
-	return g.Wait()
+	return batch
+}
+
+// sendBatches ships the metrics in chunks of at most batchSize. On failure it
+// returns the metrics that were not accepted, starting with the chunk that
+// failed, so the caller can retry exactly those.
+func (a *Agent) sendBatches(metrics []models.Metrics) ([]models.Metrics, error) {
+	for start := 0; start < len(metrics); start += a.batchSize {
+		end := min(start+a.batchSize, len(metrics))
+
+		if err := a.sendBatch(metrics[start:end]); err != nil {
+			return metrics[start:], err
+		}
+	}
+	return nil, nil
+}
+
+// returnCounters gives the deltas of an unsent batch back to the accumulator so
+// that the next report picks them up again.
+func (a *Agent) returnCounters(metrics []models.Metrics) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, m := range metrics {
+		if m.MType == models.Counter && m.Delta != nil {
+			a.lastSentCounters[m.ID] -= *m.Delta
+		}
+	}
 }
 
 // snapshotForReport copies gauges and computes counter deltas under a single lock,
@@ -208,33 +282,17 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 	return gauges, deltas
 }
 
-func (a *Agent) sendMetric(metricType, name, value string) error {
-	m := models.Metrics{
-		ID:    name,
-		MType: metricType,
+// sendBatch posts one gzip-compressed batch to /updates/. An empty batch is
+// never sent. The compressor comes from a pool and is pointed back at
+// io.Discard before it is returned, so a pooled writer never pins the payload
+// it compressed; the response body is drained so the transport can reuse the
+// connection for the next batch.
+func (a *Agent) sendBatch(metrics []models.Metrics) error {
+	if len(metrics) == 0 {
+		return nil
 	}
 
-	// Only the two known types are accepted: falling through to the counter
-	// branch would silently ship a mistyped metric that the server then
-	// rejects, with nothing pointing back at the caller.
-	switch metricType {
-	case models.Gauge:
-		val, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("parse gauge value %q: %w", value, err)
-		}
-		m.Value = &val
-	case models.Counter:
-		val, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("parse counter value %q: %w", value, err)
-		}
-		m.Delta = &val
-	default:
-		return fmt.Errorf("unsupported metric type %q for metric %q", metricType, name)
-	}
-
-	body, err := json.Marshal(m)
+	body, err := json.Marshal(metrics)
 	if err != nil {
 		return err
 	}
@@ -242,10 +300,6 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 	var buf bytes.Buffer
 	gw := gzipWriterPool.Get().(*gzip.Writer)
 	defer func() {
-		// Point the writer away from this request's buffer before pooling it:
-		// a writer sitting in the pool would otherwise keep the payload (and
-		// its backing array) alive until the next Get. Reset also restores a
-		// writer left in a bad state by a failed compression.
 		gw.Reset(io.Discard)
 		gzipWriterPool.Put(gw)
 	}()
@@ -254,13 +308,12 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 	if _, err := gw.Write(body); err != nil {
 		return err
 	}
-	// Close flushes the gzip trailer; the buffer is only complete afterwards.
 	if err := gw.Close(); err != nil {
 		return err
 	}
 	body = buf.Bytes()
 
-	url := fmt.Sprintf("%s/update", a.endpoint)
+	url := fmt.Sprintf("%s/updates/", a.endpoint)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -273,6 +326,7 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 		return err
 	}
 	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -281,8 +335,4 @@ func (a *Agent) sendMetric(metricType, name, value string) error {
 	}
 
 	return nil
-}
-
-func formatGaugeValue(value float64) string {
-	return strconv.FormatFloat(value, 'f', -1, 64)
 }

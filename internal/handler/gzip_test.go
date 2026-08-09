@@ -37,9 +37,9 @@ func gzipBytes(t *testing.T, payload string) []byte {
 	return buf.Bytes()
 }
 
-// Closing the replaced body must close both the decompressor and the body it
-// wrapped, and it must stay at exactly one close of each even when the handler
-// closes it too.
+// TestGzipRequestMiddlewareClosesBothBodiesExactlyOnce verifies that closing
+// the replaced body closes both the decompressor and the body it wrapped,
+// exactly once each, even when the handler closes it too.
 func TestGzipRequestMiddlewareClosesBothBodiesExactlyOnce(t *testing.T) {
 	orig := &countingBody{Reader: bytes.NewReader(gzipBytes(t, `{"id":"Alloc"}`))}
 	req := httptest.NewRequest(http.MethodPost, "/update", orig)
@@ -53,7 +53,6 @@ func TestGzipRequestMiddlewareClosesBothBodiesExactlyOnce(t *testing.T) {
 		}
 		got = string(body)
 
-		// The handler closes it, and so does the middleware's defer.
 		if err := r.Body.Close(); err != nil {
 			t.Errorf("first Close error = %v", err)
 		}
@@ -71,9 +70,10 @@ func TestGzipRequestMiddlewareClosesBothBodiesExactlyOnce(t *testing.T) {
 	}
 }
 
-// Without the handler touching it, the middleware still has to close the
-// decompressor: net/http closes the body it captured before the handler ran,
-// which is the original, never the replacement.
+// TestGzipRequestMiddlewareClosesWhenHandlerDoesNot verifies that the
+// middleware closes the decompressor on its own: net/http closes the body it
+// captured before the handler ran, which is the original, never the
+// replacement.
 func TestGzipRequestMiddlewareClosesWhenHandlerDoesNot(t *testing.T) {
 	orig := &countingBody{Reader: bytes.NewReader(gzipBytes(t, `{"id":"Alloc"}`))}
 	req := httptest.NewRequest(http.MethodPost, "/update", orig)
@@ -91,8 +91,9 @@ func TestGzipRequestMiddlewareClosesWhenHandlerDoesNot(t *testing.T) {
 	}
 }
 
-// Under load the connection must be reused: if request bodies were leaked, the
-// server could not keep the connection alive between requests.
+// TestGzipRequestMiddlewareReusesKeepAliveConnection verifies that the
+// connection is reused under load: a leaked request body would keep the server
+// from holding it open between requests.
 func TestGzipRequestMiddlewareReusesKeepAliveConnection(t *testing.T) {
 	var newConns atomic.Int64
 
@@ -139,15 +140,14 @@ func TestGzipRequestMiddlewareReusesKeepAliveConnection(t *testing.T) {
 	}
 }
 
-// Now that the middleware closes the original body, a handler that leaves the
-// request unread must not cost the connection: net/http drains the leftover
-// bytes after the handler returns to keep the connection alive.
+// TestGzipRequestMiddlewareKeepsConnectionWhenHandlerSkipsBody verifies that a
+// handler leaving the request unread does not cost the connection: net/http
+// drains the leftover bytes after the handler returns.
 func TestGzipRequestMiddlewareKeepsConnectionWhenHandlerSkipsBody(t *testing.T) {
 	var newConns atomic.Int64
 
 	srv := httptest.NewUnstartedServer(GzipRequestMiddleware(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			// Deliberately does not read r.Body.
 			w.WriteHeader(http.StatusOK)
 		})))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -184,8 +184,8 @@ func TestGzipRequestMiddlewareKeepsConnectionWhenHandlerSkipsBody(t *testing.T) 
 	}
 }
 
-// Closing the gzip reader twice must stay harmless: it only closes the
-// decompressor, never the underlying body.
+// TestGzipReaderDoubleCloseIsSafe verifies that closing the gzip reader twice
+// stays harmless: it only closes the decompressor, never the underlying body.
 func TestGzipReaderDoubleCloseIsSafe(t *testing.T) {
 	orig := &countingBody{Reader: bytes.NewReader(gzipBytes(t, "payload"))}
 
