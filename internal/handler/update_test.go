@@ -158,6 +158,34 @@ func TestUpdatesJSONHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects a null body", func(t *testing.T) {
+		s := repository.NewMemStorage()
+		r := newTestRouter(s)
+
+		req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("null"))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("accepts an empty batch", func(t *testing.T) {
+		s := repository.NewMemStorage()
+		r := newTestRouter(s)
+
+		req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("[]"))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+
 	t.Run("keeps the single-metric API working", func(t *testing.T) {
 		s := repository.NewMemStorage()
 		r := newTestRouter(s)

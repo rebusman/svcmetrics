@@ -4,6 +4,7 @@ go 1.25.9
 
 require (
 	github.com/go-chi/chi/v5 v5.3.0
+	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/sirupsen/logrus v1.9.4

@@ -2,6 +2,7 @@
 
 // The tests in this file need Docker: they run PostgreSQL in a throwaway
 // container through testcontainers. Run them with -tags integration.
+
 package repository
 
 import (
@@ -48,7 +49,7 @@ func postgresDSN(t *testing.T) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
 
-		pgContainer, pgErr = postgres.Run(ctx, "postgres:16-alpine",
+		pgContainer, pgErr = postgres.Run(ctx, "postgres:16.4-alpine",
 			postgres.WithDatabase("metrics"),
 			postgres.WithUsername("metrics"),
 			postgres.WithPassword("secret"),
@@ -276,9 +277,7 @@ func TestPgStorageConcurrentCounterUpdatesAreAtomic(t *testing.T) {
 		errsGot []error
 	)
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			got, err := s.UpdateCounter(ctx, name, 1)
 			mu.Lock()
 			defer mu.Unlock()
@@ -287,7 +286,7 @@ func TestPgStorageConcurrentCounterUpdatesAreAtomic(t *testing.T) {
 				return
 			}
 			seen[got]++
-		}()
+		})
 	}
 	wg.Wait()
 

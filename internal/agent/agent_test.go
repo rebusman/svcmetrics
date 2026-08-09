@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -66,7 +67,7 @@ func TestSendBatchReusesPooledGzipWriters(t *testing.T) {
 
 	a := New(srv.URL, time.Second, time.Second, 0)
 	for i := range requests {
-		if err := a.sendBatch([]models.Metrics{gaugeMetric("Alloc", float64(i)+0.5)}); err != nil {
+		if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", float64(i)+0.5)}); err != nil {
 			t.Fatalf("sendBatch %d error = %v", i, err)
 		}
 	}
@@ -97,7 +98,7 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 	defer srv.Close()
 
 	a := New(srv.URL, time.Second, time.Second, 0)
-	if err := a.sendBatch([]models.Metrics{gaugeMetric("Alloc", 12.5)}); err != nil {
+	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 12.5)}); err != nil {
 		t.Fatalf("sendBatch error = %v", err)
 	}
 
@@ -171,7 +172,7 @@ func BenchmarkSendBatch(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := a.sendBatch(batch); err != nil {
+		if err := a.sendBatch(context.Background(), batch); err != nil {
 			b.Fatalf("sendBatch error = %v", err)
 		}
 	}
@@ -252,7 +253,7 @@ func TestSendMetricsUsesBatches(t *testing.T) {
 	a.client = ts.Client()
 	seed(a)
 
-	if err := a.SendMetrics(); err != nil {
+	if err := a.SendMetrics(context.Background()); err != nil {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
@@ -300,7 +301,7 @@ func TestSendMetricsSkipsEmptyBatch(t *testing.T) {
 	a := New(ts.URL, time.Second, time.Second, 0)
 	a.client = ts.Client()
 
-	if err := a.SendMetrics(); err != nil {
+	if err := a.SendMetrics(context.Background()); err != nil {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 	if got := requests.Load(); got != 0 {
@@ -342,7 +343,7 @@ func TestSendMetricsReturnsCounterDeltaOnFailure(t *testing.T) {
 	a.client = ts.Client()
 	seed(a)
 
-	if err := a.SendMetrics(); err == nil {
+	if err := a.SendMetrics(context.Background()); err == nil {
 		t.Fatal("SendMetrics() error = nil, want a failure")
 	}
 
@@ -350,7 +351,7 @@ func TestSendMetricsReturnsCounterDeltaOnFailure(t *testing.T) {
 	fail = false
 	mu.Unlock()
 
-	if err := a.SendMetrics(); err != nil {
+	if err := a.SendMetrics(context.Background()); err != nil {
 		t.Fatalf("SendMetrics() error = %v", err)
 	}
 
@@ -392,7 +393,7 @@ func TestSendBatchesReturnsOnlyUnsentMetrics(t *testing.T) {
 		counterMetric(models.PollCount, 4),
 	}
 
-	unsent, err := a.sendBatches(batch)
+	unsent, err := a.sendBatches(context.Background(), batch)
 	if err == nil {
 		t.Fatal("sendBatches() error = nil, want a failure")
 	}
@@ -416,7 +417,7 @@ func TestSendBatchSkipsEmptyPayload(t *testing.T) {
 	a := New(ts.URL, time.Second, time.Second, 0)
 	a.client = ts.Client()
 
-	if err := a.sendBatch(nil); err != nil {
+	if err := a.sendBatch(context.Background(), nil); err != nil {
 		t.Fatalf("sendBatch(nil) error = %v", err)
 	}
 	if got := requests.Load(); got != 0 {

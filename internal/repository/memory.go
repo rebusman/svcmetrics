@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
 
 	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/retry"
 )
 
 // MemStorage keeps metrics in memory and can persist them to a JSON file.
@@ -17,6 +19,10 @@ type MemStorage struct {
 	mu       sync.RWMutex
 	gauges   map[string]float64
 	counters map[string]int64
+
+	// retry governs the snapshot file operations only: the in-memory ones
+	// cannot fail in a way a repetition would fix.
+	retry retry.Config
 }
 
 // NewMemStorage returns an empty in-memory storage.
@@ -24,7 +30,14 @@ func NewMemStorage() *MemStorage {
 	return &MemStorage{
 		gauges:   make(map[string]float64),
 		counters: make(map[string]int64),
+		retry:    retry.Config{Retriable: isRetriableFileError},
 	}
+}
+
+// SetOnRetry installs fn as the observer of the repeated snapshot file
+// operations, so the caller can log the failures the storage recovers from.
+func (s *MemStorage) SetOnRetry(fn retry.OnRetry) {
+	s.retry.OnRetry = fn
 }
 
 // UpdateGauge stores value under name and returns it.
@@ -97,9 +110,7 @@ func (s *MemStorage) GetAllGauges(_ context.Context) (map[string]float64, error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	res := make(map[string]float64, len(s.gauges))
-	for k, v := range s.gauges {
-		res[k] = v
-	}
+	maps.Copy(res, s.gauges)
 	return res, nil
 }
 
@@ -108,9 +119,7 @@ func (s *MemStorage) GetAllCounters(_ context.Context) (map[string]int64, error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	res := make(map[string]int64, len(s.counters))
-	for k, v := range s.counters {
-		res[k] = v
-	}
+	maps.Copy(res, s.counters)
 	return res, nil
 
 }
@@ -133,8 +142,19 @@ func (s *MemStorage) snapshot() []models.Metrics {
 }
 
 // Save writes a snapshot to path atomically: the data lands in a temporary
-// file next to the target, which then replaces it by a rename.
-func (s *MemStorage) Save(path string) error {
+// file next to the target, which then replaces it by a rename. A write that
+// fails for a passing reason — the target held open by another process, a busy
+// device — is repeated; each attempt starts from its own temporary file, so a
+// half-written one is never promoted. A cancelled ctx ends the retrying at
+// once, so a shutdown is never held up by the pauses between the attempts.
+func (s *MemStorage) Save(ctx context.Context, path string) error {
+	return retry.Do(ctx, s.retry, func(context.Context) error {
+		return s.save(path)
+	})
+}
+
+// save writes one snapshot to path.
+func (s *MemStorage) save(path string) error {
 	metrics := s.snapshot()
 
 	data, err := json.MarshalIndent(metrics, "", "  ")
@@ -179,10 +199,21 @@ func writeAndClose(f *os.File, data []byte) error {
 	return f.Close()
 }
 
-// Load restores metrics from a snapshot written by Save, merging them into
-// whatever the storage already holds.
-func (s *MemStorage) Load(path string) error {
-	data, err := os.ReadFile(path)
+// Load restores metrics from a snapshot written by Save, overwriting whatever
+// the storage already holds: a gauge takes the snapshot value, a counter is
+// set to the absolute value stored in the snapshot (which is the running total
+// at the time Save was called). A read that fails for a passing reason is
+// repeated, and a cancelled ctx ends the retrying at once; a missing or
+// malformed snapshot is reported immediately.
+//
+// Entries with an unknown type or without a value are skipped: the valid rest
+// of the snapshot is still loaded, and the skips are reported as an error
+// wrapping models.ErrInvalidMetric, so the caller can tell a partial restore
+// from a complete one.
+func (s *MemStorage) Load(ctx context.Context, path string) error {
+	data, err := retry.DoValue(ctx, s.retry, func(context.Context) ([]byte, error) {
+		return os.ReadFile(path)
+	})
 	if err != nil {
 		return err
 	}
@@ -195,18 +226,20 @@ func (s *MemStorage) Load(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	skipped := 0
 	for _, m := range metrics {
-		switch m.MType {
-		case models.Gauge:
-			if m.Value != nil {
-				s.gauges[m.ID] = *m.Value
-			}
-		case models.Counter:
-			if m.Delta != nil {
-				s.counters[m.ID] = *m.Delta
-			}
+		switch {
+		case m.MType == models.Gauge && m.Value != nil:
+			s.gauges[m.ID] = *m.Value
+		case m.MType == models.Counter && m.Delta != nil:
+			s.counters[m.ID] = *m.Delta
+		default:
+			skipped++
 		}
 	}
 
+	if skipped > 0 {
+		return fmt.Errorf("snapshot %s: skipped %d entries: %w", path, skipped, models.ErrInvalidMetric)
+	}
 	return nil
 }

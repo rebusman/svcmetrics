@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # Pinned to a patch release so that a rebuild months from now brings up the
+    # same server the tests were written against.
+    image: postgres:16.4-alpine
     container_name: svcmetrics-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}

@@ -17,6 +17,12 @@ import (
 	"github.com/rebusman/svcmetrics/internal/agent"
 )
 
+// logRetry reports a failed report that the agent is about to repeat, so that
+// passing network or server problems show up in the agent log.
+func logRetry(err error, attempt int, pause time.Duration) {
+	log.Printf("Retrying report (attempt %d) in %s: %v", attempt, pause, err)
+}
+
 // main wires the settings together and runs the agent until the process is
 // asked to stop.
 func main() {
@@ -62,10 +68,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	agent.New(
+	a := agent.New(
 		endpoint,
 		time.Duration(*pollInterval)*time.Second,
 		time.Duration(*reportInterval)*time.Second,
 		*batchSize,
-	).Run(ctx)
+	)
+	a.SetOnRetry(logRetry)
+	a.Run(ctx)
 }

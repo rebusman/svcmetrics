@@ -53,7 +53,7 @@ func TestMemStorageSaveLoadRoundTrip(t *testing.T) {
 	_, _ = s.UpdateCounter(ctx, "PollCount", 3)
 
 	path := filepath.Join(t.TempDir(), "metrics.json")
-	if err := s.Save(path); err != nil {
+	if err := s.Save(ctx, path); err != nil {
 		t.Fatalf("Save error = %v", err)
 	}
 
@@ -71,7 +71,7 @@ func TestMemStorageSaveLoadRoundTrip(t *testing.T) {
 	}
 
 	loaded := NewMemStorage()
-	if err := loaded.Load(path); err != nil {
+	if err := loaded.Load(ctx, path); err != nil {
 		t.Fatalf("Load error = %v", err)
 	}
 
@@ -90,12 +90,12 @@ func TestMemStorageSaveLoadLargeCounter(t *testing.T) {
 	_, _ = s.UpdateCounter(ctx, "PollCount", bigCounter)
 
 	path := filepath.Join(t.TempDir(), "metrics_large_counter.json")
-	if err := s.Save(path); err != nil {
+	if err := s.Save(ctx, path); err != nil {
 		t.Fatalf("Save error = %v", err)
 	}
 
 	loaded := NewMemStorage()
-	if err := loaded.Load(path); err != nil {
+	if err := loaded.Load(ctx, path); err != nil {
 		t.Fatalf("Load error = %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestMemStorageGetAllOnEmptyStorage(t *testing.T) {
 func TestMemStorageLoadErrors(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		s := NewMemStorage()
-		if err := s.Load(filepath.Join(t.TempDir(), "nope.json")); err == nil {
+		if err := s.Load(context.Background(), filepath.Join(t.TempDir(), "nope.json")); err == nil {
 			t.Fatal("Load of a missing file returned nil, want error")
 		}
 	})
@@ -176,7 +176,7 @@ func TestMemStorageLoadErrors(t *testing.T) {
 			t.Fatalf("WriteFile error = %v", err)
 		}
 		s := NewMemStorage()
-		if err := s.Load(path); err == nil {
+		if err := s.Load(context.Background(), path); err == nil {
 			t.Fatal("Load of malformed JSON returned nil, want error")
 		}
 	})
@@ -187,14 +187,16 @@ func TestMemStorageLoadErrors(t *testing.T) {
 			t.Fatalf("WriteFile error = %v", err)
 		}
 		s := NewMemStorage()
-		if err := s.Load(path); err == nil {
+		if err := s.Load(context.Background(), path); err == nil {
 			t.Fatal("Load of an empty file returned nil, want error")
 		}
 	})
 }
 
 // TestMemStorageLoadSkipsEntriesWithoutValues verifies that entries carrying no
-// data are skipped rather than recorded as a zero.
+// data are skipped rather than recorded as a zero, and that the skips are
+// reported as an error wrapping models.ErrInvalidMetric while the valid rest
+// of the snapshot is still loaded.
 func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "partial.json")
@@ -205,8 +207,8 @@ func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	}
 
 	s := NewMemStorage()
-	if err := s.Load(path); err != nil {
-		t.Fatalf("Load error = %v", err)
+	if err := s.Load(ctx, path); !errors.Is(err, models.ErrInvalidMetric) {
+		t.Fatalf("Load error = %v, want ErrInvalidMetric for the skipped entries", err)
 	}
 
 	if _, err := s.GetGauge(ctx, "NoValue"); !errors.Is(err, models.ErrNotFound) {
@@ -220,6 +222,69 @@ func TestMemStorageLoadSkipsEntriesWithoutValues(t *testing.T) {
 	}
 	if got, err := s.GetGauge(ctx, "Good"); err != nil || got != 4.5 {
 		t.Fatalf("GetGauge(Good) = %v, err = %v, want 4.5, nil", got, err)
+	}
+}
+
+// TestMemStorageLoadOverwritesCounters verifies that loading a snapshot
+// overwrites the current counter values with the absolute totals stored in the
+// snapshot, regardless of what the storage held before.
+func TestMemStorageLoadOverwritesCounters(t *testing.T) {
+	ctx := context.Background()
+
+	saved := NewMemStorage()
+	_, _ = saved.UpdateCounter(ctx, "PollCount", 5)
+	_, _ = saved.UpdateGauge(ctx, "Alloc", 1.5)
+
+	path := filepath.Join(t.TempDir(), "metrics.json")
+	if err := saved.Save(ctx, path); err != nil {
+		t.Fatalf("Save error = %v", err)
+	}
+
+	s := NewMemStorage()
+	_, _ = s.UpdateCounter(ctx, "PollCount", 7)
+	_, _ = s.UpdateGauge(ctx, "Alloc", 9.5)
+
+	if err := s.Load(ctx, path); err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+
+	// Counter must be the snapshot value (5), not 7+5=12.
+	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 5 {
+		t.Fatalf("counter after Load = %d, err = %v, want 5 (snapshot value)", got, err)
+	}
+	// Gauge is also overwritten by the snapshot value.
+	if got, err := s.GetGauge(ctx, "Alloc"); err != nil || got != 1.5 {
+		t.Fatalf("gauge after Load = %v, err = %v, want 1.5 (snapshot value)", got, err)
+	}
+}
+
+// TestMemStorageLoadIsIdempotent verifies that calling Load twice on the same
+// snapshot produces the same result as calling it once: counters must not
+// double-count.
+func TestMemStorageLoadIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	saved := NewMemStorage()
+	_, _ = saved.UpdateCounter(ctx, "PollCount", 42)
+	_, _ = saved.UpdateGauge(ctx, "Alloc", 3.14)
+
+	path := filepath.Join(t.TempDir(), "metrics.json")
+	if err := saved.Save(ctx, path); err != nil {
+		t.Fatalf("Save error = %v", err)
+	}
+
+	s := NewMemStorage()
+	for i := range 3 {
+		if err := s.Load(ctx, path); err != nil {
+			t.Fatalf("Load #%d error = %v", i+1, err)
+		}
+	}
+
+	if got, err := s.GetCounter(ctx, "PollCount"); err != nil || got != 42 {
+		t.Fatalf("counter after 3x Load = %d, err = %v, want 42", got, err)
+	}
+	if got, err := s.GetGauge(ctx, "Alloc"); err != nil || got != 3.14 {
+		t.Fatalf("gauge after 3x Load = %v, err = %v, want 3.14", got, err)
 	}
 }
 
@@ -268,13 +333,13 @@ func TestMemStorageSaveOverwritesAndLeavesNoTempFiles(t *testing.T) {
 
 	s := NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 1.5)
-	if err := s.Save(path); err != nil {
+	if err := s.Save(ctx, path); err != nil {
 		t.Fatalf("first Save error = %v", err)
 	}
 
 	_, _ = s.UpdateGauge(ctx, "Alloc", 2.5)
 	_, _ = s.UpdateCounter(ctx, "PollCount", 4)
-	if err := s.Save(path); err != nil {
+	if err := s.Save(ctx, path); err != nil {
 		t.Fatalf("second Save error = %v", err)
 	}
 
@@ -291,7 +356,7 @@ func TestMemStorageSaveOverwritesAndLeavesNoTempFiles(t *testing.T) {
 	}
 
 	loaded := NewMemStorage()
-	if err := loaded.Load(path); err != nil {
+	if err := loaded.Load(ctx, path); err != nil {
 		t.Fatalf("Load error = %v", err)
 	}
 	if got, err := loaded.GetGauge(ctx, "Alloc"); err != nil || got != 2.5 {
@@ -311,7 +376,7 @@ func TestMemStorageSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 
 	s := NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 7.25)
-	if err := s.Save(path); err != nil {
+	if err := s.Save(ctx, path); err != nil {
 		t.Fatalf("Save error = %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -320,7 +385,7 @@ func TestMemStorageSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 	}
 
 	_, _ = s.UpdateGauge(ctx, "Alloc", 99)
-	if err := s.Save(filepath.Join(dir, "missing", "metrics.json")); err == nil {
+	if err := s.Save(ctx, filepath.Join(dir, "missing", "metrics.json")); err == nil {
 		t.Fatal("Save into a missing directory returned nil, want error")
 	}
 
@@ -346,7 +411,7 @@ func TestMemStorageSaveCleansUpWhenRenameFails(t *testing.T) {
 
 	s := NewMemStorage()
 	_, _ = s.UpdateGauge(ctx, "Alloc", 1)
-	if err := s.Save(target); err == nil {
+	if err := s.Save(ctx, target); err == nil {
 		t.Fatal("Save over a directory returned nil, want error")
 	}
 
@@ -439,9 +504,7 @@ func TestMemStorageUpdateBatchIsAtomicForReaders(t *testing.T) {
 	names := []string{"A", "B", "C", "D"}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 1; i <= rounds; i++ {
 			batch := make([]models.Metrics, 0, len(names))
 			for _, name := range names {
@@ -452,7 +515,7 @@ func TestMemStorageUpdateBatchIsAtomicForReaders(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	var mismatches int
 	for range rounds * 10 {
@@ -496,16 +559,14 @@ func TestMemStorageUpdateBatchConcurrentCounters(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range rounds {
 				if err := s.UpdateBatch(ctx, []models.Metrics{counter("PollCount", 1)}); err != nil {
 					t.Errorf("UpdateBatch error = %v", err)
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

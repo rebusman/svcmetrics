@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/retry"
 )
 
 // Defaults applied by New when the caller leaves a setting unset.
@@ -29,9 +31,6 @@ const (
 	// DefaultBatchSize is how many metrics go into one POST /updates/ request
 	// unless the caller configures something else.
 	DefaultBatchSize = 32
-
-	reportMaxAttempts   = 3
-	reportRetryInterval = 1 * time.Second
 )
 
 // gzipWriterPool recycles the compressors used for the request bodies.
@@ -47,8 +46,9 @@ type metricState struct {
 	counters map[string]int64
 }
 
-// Agent polls the runtime for metrics and reports them to the server. It is
-// safe for concurrent use.
+// Agent polls the runtime for metrics and reports them to the server. A report
+// that failed for a passing reason is repeated before the metrics it carries
+// are handed back to the accumulator. It is safe for concurrent use.
 type Agent struct {
 	endpoint string
 	client   *http.Client
@@ -56,6 +56,10 @@ type Agent struct {
 	pollInterval   time.Duration
 	reportInterval time.Duration
 	batchSize      int
+
+	// retry governs the reports only: collecting metrics from the runtime
+	// cannot fail in a way a repetition would fix.
+	retry retry.Config
 
 	mu               sync.RWMutex
 	metrics          metricState
@@ -85,12 +89,19 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
 		batchSize:      batchSize,
+		retry:          retry.Config{Retriable: isRetriableSendError},
 		metrics: metricState{
 			gauges:   make(map[string]float64, len(models.GaugeMetricNames)),
 			counters: make(map[string]int64, len(models.CounterMetricNames)),
 		},
 		lastSentCounters: make(map[string]int64, len(models.CounterMetricNames)),
 	}
+}
+
+// SetOnRetry installs fn as the observer of the repeated reports, so the
+// caller can log the failures the agent recovers from.
+func (a *Agent) SetOnRetry(fn retry.OnRetry) {
+	a.retry.OnRetry = fn
 }
 
 // Run collects and reports metrics until the context is cancelled.
@@ -113,9 +124,10 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 }
 
-// reportWithRetry sends the collected metrics, retrying on failure up to
-// reportMaxAttempts times with a fixed backoff. It stops early if the context
-// is cancelled.
+// reportWithRetry sends the collected metrics, repeating a report that failed
+// for a retriable reason on the schedule of [retry.DefaultIntervals]. It stops
+// early if the context is cancelled or if the server rejected the batch on its
+// merits, which no repetition will change.
 //
 // The snapshot is taken once and only the batches the server has not accepted
 // are retried: resending an accepted batch would count its counter deltas
@@ -126,25 +138,14 @@ func (a *Agent) reportWithRetry(ctx context.Context) {
 		return
 	}
 
-	for attempt := 1; attempt <= reportMaxAttempts; attempt++ {
+	err := retry.Do(ctx, a.retry, func(ctx context.Context) error {
 		var err error
-		if pending, err = a.sendBatches(pending); err == nil {
-			return
-		}
-
-		if attempt == reportMaxAttempts {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			a.returnCounters(pending)
-			return
-		case <-time.After(reportRetryInterval):
-		}
+		pending, err = a.sendBatches(ctx, pending)
+		return err
+	})
+	if err != nil {
+		a.returnCounters(pending)
 	}
-
-	a.returnCounters(pending)
 }
 
 // CollectRuntimeMetrics reads the runtime memory statistics into the agent's
@@ -187,20 +188,19 @@ func (a *Agent) CollectRuntimeMetrics() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	for name, value := range values {
-		a.metrics.gauges[name] = value
-	}
+	maps.Copy(a.metrics.gauges, values)
 	a.metrics.counters[models.PollCount]++
 }
 
-// SendMetrics reports everything collected so far as one or more batches.
-func (a *Agent) SendMetrics() error {
+// SendMetrics reports everything collected so far as one or more batches. It
+// makes a single attempt: the retrying report is what Run drives.
+func (a *Agent) SendMetrics(ctx context.Context) error {
 	pending := a.collectBatch()
 	if len(pending) == 0 {
 		return nil
 	}
 
-	unsent, err := a.sendBatches(pending)
+	unsent, err := a.sendBatches(ctx, pending)
 	if err != nil {
 		a.returnCounters(unsent)
 		return err
@@ -237,11 +237,11 @@ func (a *Agent) collectBatch() []models.Metrics {
 // sendBatches ships the metrics in chunks of at most batchSize. On failure it
 // returns the metrics that were not accepted, starting with the chunk that
 // failed, so the caller can retry exactly those.
-func (a *Agent) sendBatches(metrics []models.Metrics) ([]models.Metrics, error) {
+func (a *Agent) sendBatches(ctx context.Context, metrics []models.Metrics) ([]models.Metrics, error) {
 	for start := 0; start < len(metrics); start += a.batchSize {
 		end := min(start+a.batchSize, len(metrics))
 
-		if err := a.sendBatch(metrics[start:end]); err != nil {
+		if err := a.sendBatch(ctx, metrics[start:end]); err != nil {
 			return metrics[start:], err
 		}
 	}
@@ -268,9 +268,7 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 	defer a.mu.Unlock()
 
 	gauges := make(map[string]float64, len(a.metrics.gauges))
-	for k, v := range a.metrics.gauges {
-		gauges[k] = v
-	}
+	maps.Copy(gauges, a.metrics.gauges)
 
 	deltas := make(map[string]int64, len(models.CounterMetricNames))
 	for _, name := range models.CounterMetricNames {
@@ -287,7 +285,7 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 // io.Discard before it is returned, so a pooled writer never pins the payload
 // it compressed; the response body is drained so the transport can reuse the
 // connection for the next batch.
-func (a *Agent) sendBatch(metrics []models.Metrics) error {
+func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -314,7 +312,7 @@ func (a *Agent) sendBatch(metrics []models.Metrics) error {
 	body = buf.Bytes()
 
 	url := fmt.Sprintf("%s/updates/", a.endpoint)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -331,7 +329,7 @@ func (a *Agent) sendBatch(metrics []models.Metrics) error {
 	}()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
+		return &statusError{code: resp.StatusCode, status: resp.Status}
 	}
 
 	return nil

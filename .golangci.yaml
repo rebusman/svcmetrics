@@ -14,12 +14,38 @@ linters:
     - errorlint
     - gocritic
     - revive
+    - godoclint
+    - godot
+    - modernize
   settings:
     revive:
       rules:
+        # The doc comment rules live in godoclint, which reports the same
+        # findings with more control over what is required.
         - name: exported
           disabled: true
+    godoclint:
+      default: none
+      enable:
+        # Every package has a comment, in exactly one file, starting with
+        # "Package <name>".
+        - require-pkg-doc
+        - single-pkg-doc
+        - pkg-doc
+        # Every exported symbol has a comment, and it starts with the name of
+        # the symbol it documents.
+        - require-doc
+        - start-with-name
+        - no-unused-link
+        - deprecated
+    godot:
+      scope: declarations
   exclusions:
+    rules:
+      # Test functions carry comments only where the case needs explaining.
+      - path: _test\.go
+        linters:
+          - godoclint
     presets:
       - comments
       - common-false-positives
@@ -30,4 +56,3 @@ formatters:
   enable:
     - gofmt
     - goimports
-
