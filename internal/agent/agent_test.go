@@ -1,15 +1,164 @@
 package agent
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
+
+// The server must still receive valid gzip after the writer has been recycled
+// through the pool many times — a Reset that misses would corrupt the stream.
+func TestSendMetricReusesPooledGzipWriters(t *testing.T) {
+	const requests = 50
+
+	var (
+		mu      sync.Mutex
+		decoded []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Encoding"); got != "gzip" {
+			t.Errorf("Content-Encoding = %q, want gzip", got)
+		}
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			t.Errorf("gzip.NewReader error = %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer func() { _ = zr.Close() }()
+
+		body, err := io.ReadAll(zr)
+		if err != nil {
+			t.Errorf("read decompressed body error = %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		decoded = append(decoded, string(body))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second)
+	for i := range requests {
+		if err := a.sendMetric(models.Gauge, "Alloc", strconv.Itoa(i)+".5"); err != nil {
+			t.Fatalf("sendMetric %d error = %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(decoded) != requests {
+		t.Fatalf("server received %d bodies, want %d", len(decoded), requests)
+	}
+	for i, body := range decoded {
+		want := `"value":` + strconv.Itoa(i) + `.5`
+		if !strings.Contains(body, want) {
+			t.Errorf("body %d = %s, want it to contain %s", i, body, want)
+		}
+	}
+}
+
+// A writer resting in the pool must not point at the buffer it just compressed
+// into: it would pin that payload until the next Get.
+func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second)
+	if err := a.sendMetric(models.Gauge, "Alloc", "12.5"); err != nil {
+		t.Fatalf("sendMetric error = %v", err)
+	}
+
+	gw := gzipWriterPool.Get().(*gzip.Writer)
+	defer func() {
+		gw.Reset(io.Discard)
+		gzipWriterPool.Put(gw)
+	}()
+
+	// gzip.Writer keeps its destination in an unexported field, so this reads
+	// the type only. If the stdlib ever renames it, skip rather than fail.
+	dest := reflect.ValueOf(gw).Elem().FieldByName("w")
+	if !dest.IsValid() || dest.Kind() != reflect.Interface {
+		t.Skip("gzip.Writer has no inspectable destination field anymore")
+	}
+	if dest.IsNil() {
+		return // a freshly constructed writer from pool.New — nothing retained
+	}
+	if got := dest.Elem().Type().String(); strings.Contains(got, "bytes.Buffer") {
+		t.Fatalf("pooled writer still points at %s, retaining the request payload", got)
+	}
+}
+
+// These two isolate what the pool changes: BenchmarkSendMetric below is
+// dominated by the HTTP round trip, which hides the compressor's cost.
+var benchPayload = []byte(`{"id":"Alloc","type":"gauge","value":123456.789}`)
+
+func BenchmarkGzipCompressPooled(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		var buf bytes.Buffer
+		gw := gzipWriterPool.Get().(*gzip.Writer)
+		gw.Reset(&buf)
+		if _, err := gw.Write(benchPayload); err != nil {
+			b.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			b.Fatal(err)
+		}
+		gw.Reset(io.Discard)
+		gzipWriterPool.Put(gw)
+		_ = buf.Bytes()
+	}
+}
+
+func BenchmarkGzipCompressFresh(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		var buf bytes.Buffer
+		gw := gzip.NewWriter(&buf)
+		if _, err := gw.Write(benchPayload); err != nil {
+			b.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			b.Fatal(err)
+		}
+		_ = buf.Bytes()
+	}
+}
+
+// Run with -benchmem to see the allocation difference the pool buys.
+func BenchmarkSendMetric(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := a.sendMetric(models.Gauge, "Alloc", "12.5"); err != nil {
+			b.Fatalf("sendMetric error = %v", err)
+		}
+	}
+}
 
 func TestCollectRuntimeMetrics(t *testing.T) {
 	a := New("", 0, 0)
@@ -118,5 +267,51 @@ func TestSendMetricInvalidValue(t *testing.T) {
 				t.Fatalf("sendMetric() error = nil, want error")
 			}
 		})
+	}
+}
+
+// An unknown type must fail before anything is sent, rather than being
+// serialized as a counter and rejected by the server.
+func TestSendMetricRejectsUnknownType(t *testing.T) {
+	var requests atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second)
+
+	tests := []struct {
+		name       string
+		metricType string
+		value      string
+	}{
+		{name: "unknown type", metricType: "histogram", value: "1"},
+		{name: "empty type", metricType: "", value: "1"},
+		{name: "wrong case", metricType: "Gauge", value: "1.5"},
+		{name: "value parseable as int", metricType: "summary", value: "42"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := a.sendMetric(tt.metricType, "SomeMetric", tt.value)
+			if err == nil {
+				t.Fatalf("sendMetric(%q) error = nil, want error", tt.metricType)
+			}
+			// The message has to name the offending type, otherwise the caller
+			// cannot tell which metric was misconfigured.
+			if !strings.Contains(err.Error(), tt.metricType) && tt.metricType != "" {
+				t.Errorf("error %q does not mention the type %q", err, tt.metricType)
+			}
+			if !strings.Contains(err.Error(), "SomeMetric") {
+				t.Errorf("error %q does not mention the metric name", err)
+			}
+		})
+	}
+
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("server received %d requests, want 0 — nothing may be sent for an unsupported type", got)
 	}
 }

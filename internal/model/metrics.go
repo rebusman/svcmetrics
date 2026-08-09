@@ -1,9 +1,13 @@
 package models
 
+import "errors"
+
 const (
 	Counter = "counter"
 	Gauge   = "gauge"
 )
+
+var ErrNotFound = errors.New("metric not found")
 
 // Special metric names that are not part of the runtime package.
 const (

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"html/template"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/storage"
 )
 
 var listTmpl = template.Must(template.New("metrics").Parse(`
@@ -33,7 +35,7 @@ var listTmpl = template.Must(template.New("metrics").Parse(`
 </html>`))
 
 // ValueJSONHandler handles POST /value.
-func ValueJSONHandler(s Storage) http.HandlerFunc {
+func ValueJSONHandler(s storage.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
@@ -50,22 +52,24 @@ func ValueJSONHandler(s Storage) http.HandlerFunc {
 			return
 		}
 
+		ctx := r.Context()
+
 		var result models.Metrics
 		result.ID = m.ID
 		result.MType = m.MType
 
 		switch m.MType {
 		case models.Gauge:
-			val, err := s.GetGauge(m.ID)
+			val, err := s.GetGauge(ctx, m.ID)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusNotFound)
+				writeStorageError(w, err)
 				return
 			}
 			result.Value = &val
 		case models.Counter:
-			val, err := s.GetCounter(m.ID)
+			val, err := s.GetCounter(ctx, m.ID)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusNotFound)
+				writeStorageError(w, err)
 				return
 			}
 			result.Delta = &val
@@ -74,33 +78,45 @@ func ValueJSONHandler(s Storage) http.HandlerFunc {
 			return
 		}
 
+		// Encode before committing the response: once the status line is out,
+		// http.Error can no longer change it and would only append its message
+		// to the JSON body.
+		var payload bytes.Buffer
+		if err := json.NewEncoder(&payload).Encode(result); err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(result); err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		}
+		// A failed write here means the client is gone: the status line has
+		// shipped, so there is nobody left to report an error to. The
+		// ResponseWriter wrapper in cmd/server records it for the request log.
+		_, _ = payload.WriteTo(w)
 	}
 }
 
 // ValueHandler handles GET /value/{type}/{name}.
-func ValueHandler(s Storage) http.HandlerFunc {
+func ValueHandler(s storage.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		mType := chi.URLParam(r, "type")
 		mName := chi.URLParam(r, "name")
 
+		ctx := r.Context()
+
 		var value string
 		switch mType {
 		case models.Gauge:
-			val, err := s.GetGauge(mName)
+			val, err := s.GetGauge(ctx, mName)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusNotFound)
+				writeStorageError(w, err)
 				return
 			}
 			value = strconv.FormatFloat(val, 'f', -1, 64)
 		case models.Counter:
-			val, err := s.GetCounter(mName)
+			val, err := s.GetCounter(ctx, mName)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusNotFound)
+				writeStorageError(w, err)
 				return
 			}
 			value = strconv.FormatInt(val, 10)
@@ -111,28 +127,48 @@ func ValueHandler(s Storage) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(value)); err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
+		// Response already committed; the write error is logged by the
+		// ResponseWriter wrapper in cmd/server.
+		_, _ = w.Write([]byte(value))
 	}
 }
 
 // ListHandler handles GET /.
-func ListHandler(s Storage) http.HandlerFunc {
+func ListHandler(s storage.Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		gauges, err := s.GetAllGauges(ctx)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		counters, err := s.GetAllCounters(ctx)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+
 		data := struct {
 			Gauges   map[string]float64
 			Counters map[string]int64
 		}{
-			Gauges:   s.GetAllGauges(),
-			Counters: s.GetAllCounters(),
+			Gauges:   gauges,
+			Counters: counters,
+		}
+
+		// Render into a buffer first: a template that fails halfway through
+		// would otherwise leave a partial page that no error can take back.
+		var page bytes.Buffer
+		if err := listTmpl.Execute(&page, data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
-		if err := listTmpl.Execute(w, data); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		// Response already committed; the write error is logged by the
+		// ResponseWriter wrapper in cmd/server.
+		_, _ = page.WriteTo(w)
 	}
 }

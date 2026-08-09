@@ -26,4 +26,3 @@ vendor/
 
 # Local secrets / environment
 .env
-/cmd/server/e2e_test.go
