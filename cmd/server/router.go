@@ -19,15 +19,22 @@ const requestTimeout = 12 * time.Second
 
 // newRouter builds the HTTP router: the middleware chain plus every metric
 // endpoint. Both /updates and /updates/ are registered because chi treats them
-// as distinct patterns and clients use either.
-func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger) chi.Router {
+// as distinct patterns and clients use either. A non-empty key enables
+// verification of request signatures and signing of response bodies.
+//
+// The signature middleware sits between the logger and the compression pair on
+// purpose: outside compression, so the digest covers the bytes that actually
+// travel; inside logging, so a request rejected over a bad signature still
+// reaches the log.
+func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
+	r.Use(loggingMiddleware(log))
+	r.Use(handler.HashMiddleware(key))
 	r.Use(handler.GzipRequestMiddleware)
 	r.Use(handler.GzipResponseMiddleware)
-	r.Use(loggingMiddleware(log))
 
 	r.Post("/update", handler.UpdateJSONHandler(hs))
 	r.Post("/updates", handler.UpdatesJSONHandler(hs))

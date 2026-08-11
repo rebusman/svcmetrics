@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
@@ -65,7 +66,7 @@ func TestSendBatchReusesPooledGzipWriters(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0)
+	a := New(srv.URL, time.Second, time.Second, 0, "")
 	for i := range requests {
 		if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", float64(i)+0.5)}); err != nil {
 			t.Fatalf("sendBatch %d error = %v", i, err)
@@ -97,7 +98,7 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0)
+	a := New(srv.URL, time.Second, time.Second, 0, "")
 	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 12.5)}); err != nil {
 		t.Fatalf("sendBatch error = %v", err)
 	}
@@ -167,7 +168,7 @@ func BenchmarkSendBatch(b *testing.B) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0)
+	a := New(srv.URL, time.Second, time.Second, 0, "")
 	batch := []models.Metrics{gaugeMetric("Alloc", 12.5)}
 
 	b.ReportAllocs()
@@ -179,7 +180,7 @@ func BenchmarkSendBatch(b *testing.B) {
 }
 
 func TestCollectRuntimeMetrics(t *testing.T) {
-	a := New("", 0, 0, 0)
+	a := New("", 0, 0, 0, "")
 
 	a.CollectRuntimeMetrics()
 	a.CollectRuntimeMetrics()
@@ -249,7 +250,7 @@ func TestSendMetricsUsesBatches(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, 2*time.Second, 10*time.Second, batchSize)
+	a := New(ts.URL, 2*time.Second, 10*time.Second, batchSize, "")
 	a.client = ts.Client()
 	seed(a)
 
@@ -298,7 +299,7 @@ func TestSendMetricsSkipsEmptyBatch(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 
 	if err := a.SendMetrics(context.Background()); err != nil {
@@ -339,7 +340,7 @@ func TestSendMetricsReturnsCounterDeltaOnFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 	seed(a)
 
@@ -383,7 +384,7 @@ func TestSendBatchesReturnsOnlyUnsentMetrics(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 2)
+	a := New(ts.URL, time.Second, time.Second, 2, "")
 	a.client = ts.Client()
 
 	batch := []models.Metrics{
@@ -414,7 +415,7 @@ func TestSendBatchSkipsEmptyPayload(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 
 	if err := a.sendBatch(context.Background(), nil); err != nil {
@@ -440,9 +441,91 @@ func TestNewBatchSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := New("", 0, 0, tt.size).batchSize; got != tt.want {
+			if got := New("", 0, 0, tt.size, "").batchSize; got != tt.want {
 				t.Fatalf("batchSize = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSendBatchSignsCompressedBody verifies that a keyed agent signs the bytes
+// it puts on the wire — the gzip stream — and not the JSON behind it, since the
+// server verifies the request before decompressing it.
+func TestSendBatchSignsCompressedBody(t *testing.T) {
+	const key = "secret"
+
+	var (
+		mu   sync.Mutex
+		sig  string
+		body []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading the request body: %v", err)
+		}
+		mu.Lock()
+		sig = r.Header.Get(hashing.Header)
+		body = raw
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second, 0, key)
+	metrics := []models.Metrics{gaugeMetric("Alloc", 1.5)}
+	if err := a.sendBatch(context.Background(), metrics); err != nil {
+		t.Fatalf("sendBatch() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if sig == "" {
+		t.Fatal("a keyed agent sent no signature")
+	}
+	if !hashing.Equal(sig, body, key) {
+		t.Error("signature does not match the transmitted body")
+	}
+
+	plain, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatalf("marshalling the batch: %v", err)
+	}
+	if hashing.Equal(sig, plain, key) {
+		t.Error("signature covers the uncompressed JSON, want the compressed body")
+	}
+}
+
+// TestSendBatchWithoutKeyIsUnsigned verifies that an agent without a key sends
+// no signature at all, so a server without a key sees an ordinary request.
+func TestSendBatchWithoutKeyIsUnsigned(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen bool
+		sig  string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = true
+		sig = r.Header.Get(hashing.Header)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second, 0, "")
+	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1.5)}); err != nil {
+		t.Fatalf("sendBatch() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !seen {
+		t.Fatal("the request never reached the server")
+	}
+	if sig != "" {
+		t.Errorf("signature = %q, want none", sig)
 	}
 }

@@ -88,7 +88,7 @@ func TestIsRetriableSendError(t *testing.T) {
 
 // newTestAgent returns an agent talking to ts and retrying without waiting.
 func newTestAgent(ts *httptest.Server) *Agent {
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 	a.retry.Intervals = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 	return a
@@ -203,7 +203,7 @@ func TestReportStopsWhenContextIsCancelled(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 	a.retry.Intervals = []time.Duration{time.Hour, time.Hour, time.Hour}
 	seed(a)
@@ -238,7 +238,7 @@ func TestSendBatchReportsStatusCode(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "")
 	a.client = ts.Client()
 
 	err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1.5)})

@@ -1,5 +1,7 @@
 // Package agent collects runtime metrics and reports them to the metrics
-// server in gzip-compressed batches.
+// server in gzip-compressed batches. An agent configured with a key signs the
+// compressed request body and puts the digest in [hashing.Header]; an agent
+// without one sends no signature at all.
 package agent
 
 import (
@@ -17,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/retry"
 )
@@ -56,6 +59,7 @@ type Agent struct {
 	pollInterval   time.Duration
 	reportInterval time.Duration
 	batchSize      int
+	key            string
 
 	// retry governs the reports only: collecting metrics from the runtime
 	// cannot fail in a way a repetition would fix.
@@ -68,8 +72,8 @@ type Agent struct {
 
 // New returns an agent reporting to endpoint. batchSize caps how many metrics
 // travel in one request; a non-positive value of any setting falls back to its
-// default.
-func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize int) *Agent {
+// default. A non-empty key enables HMAC-SHA256 request signing.
+func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize int, key string) *Agent {
 	if endpoint == "" {
 		endpoint = defaultServerAddress
 	}
@@ -89,6 +93,7 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
 		batchSize:      batchSize,
+		key:            key,
 		retry:          retry.Config{Retriable: isRetriableSendError},
 		metrics: metricState{
 			gauges:   make(map[string]float64, len(models.GaugeMetricNames)),
@@ -280,11 +285,15 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 	return gauges, deltas
 }
 
-// sendBatch posts one gzip-compressed batch to /updates/. An empty batch is
-// never sent. The compressor comes from a pool and is pointed back at
-// io.Discard before it is returned, so a pooled writer never pins the payload
-// it compressed; the response body is drained so the transport can reuse the
-// connection for the next batch.
+// sendBatch posts one gzip-compressed batch to /updates/. When the agent has a
+// key, the complete compressed body is signed and the digest goes into
+// [hashing.Header] — the server verifies the request before it decompresses
+// it, so the JSON behind the gzip is the wrong thing to sign. An empty batch is
+// never sent. The
+// compressor comes from a pool and is pointed back at io.Discard before it is
+// returned, so a pooled writer never pins the payload it compressed; the
+// response body is drained so the transport can reuse the connection for the
+// next batch.
 func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
@@ -318,6 +327,9 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+	if a.key != "" {
+		req.Header.Set(hashing.Header, hashing.Sum(body, a.key))
+	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {

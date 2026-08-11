@@ -1,6 +1,8 @@
 // Command agent collects runtime metrics and reports them to the metrics
 // server. Settings come from flags and are overridden by the ADDRESS,
-// REPORT_INTERVAL, POLL_INTERVAL and BATCH_SIZE environment variables.
+// REPORT_INTERVAL, POLL_INTERVAL, BATCH_SIZE and KEY environment variables.
+// When KEY is non-empty, every request body is signed with HMAC-SHA256 and the
+// hexadecimal digest is sent in the HashSHA256 header.
 package main
 
 import (
@@ -30,6 +32,7 @@ func main() {
 	reportInterval := flag.Int("r", 10, "report interval in seconds")
 	pollInterval := flag.Int("p", 2, "poll interval in seconds")
 	batchSize := flag.Int("b", agent.DefaultBatchSize, "number of metrics per batch request")
+	key := flag.String("k", "", "key for signing request bodies")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
@@ -59,6 +62,9 @@ func main() {
 			log.Printf("Invalid BATCH_SIZE value: %s, using default\n", envBatchSize)
 		}
 	}
+	if envKey := os.Getenv("KEY"); envKey != "" {
+		*key = envKey
+	}
 
 	endpoint := *addr
 	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
@@ -73,6 +79,7 @@ func main() {
 		time.Duration(*pollInterval)*time.Second,
 		time.Duration(*reportInterval)*time.Second,
 		*batchSize,
+		*key,
 	)
 	a.SetOnRetry(logRetry)
 	a.Run(ctx)

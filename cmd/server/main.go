@@ -1,7 +1,9 @@
 // Command server serves the metrics HTTP API and persists the metrics in
 // PostgreSQL, in a JSON file or in memory. Settings come from flags and are
-// overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE and
-// DATABASE_DSN environment variables.
+// overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE,
+// DATABASE_DSN and KEY environment variables. When KEY is non-empty, the
+// server verifies request bodies and signs response bodies with HMAC-SHA256
+// using the HashSHA256 HTTP header.
 package main
 
 import (
@@ -174,6 +176,7 @@ func main() {
 	fileStoragePath := flag.String("f", "metrics_storage.json", "path to storage file")
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
+	key := flag.String("k", "", "key for signing request and response bodies")
 	flag.Parse()
 
 	log := logrus.New()
@@ -207,6 +210,9 @@ func main() {
 
 	if envDatabaseDSN := os.Getenv("DATABASE_DSN"); envDatabaseDSN != "" {
 		*databaseDSN = envDatabaseDSN
+	}
+	if envKey := os.Getenv("KEY"); envKey != "" {
+		*key = envKey
 	}
 
 	var (
@@ -259,7 +265,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	r := newRouter(log, hs, pinger)
+	r := newRouter(log, hs, pinger, *key)
 
 	// The write timeout sits above requestTimeout on purpose: the router gives
 	// up on a request first and answers 504, and the connection is only dropped
