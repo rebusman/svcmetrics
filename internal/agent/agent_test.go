@@ -66,7 +66,7 @@ func TestSendBatchReusesPooledGzipWriters(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0, "")
+	a := New(srv.URL, time.Second, time.Second, 0, "", 0)
 	for i := range requests {
 		if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", float64(i)+0.5)}); err != nil {
 			t.Fatalf("sendBatch %d error = %v", i, err)
@@ -98,7 +98,7 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0, "")
+	a := New(srv.URL, time.Second, time.Second, 0, "", 0)
 	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 12.5)}); err != nil {
 		t.Fatalf("sendBatch error = %v", err)
 	}
@@ -168,7 +168,7 @@ func BenchmarkSendBatch(b *testing.B) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0, "")
+	a := New(srv.URL, time.Second, time.Second, 0, "", 0)
 	batch := []models.Metrics{gaugeMetric("Alloc", 12.5)}
 
 	b.ReportAllocs()
@@ -180,7 +180,7 @@ func BenchmarkSendBatch(b *testing.B) {
 }
 
 func TestCollectRuntimeMetrics(t *testing.T) {
-	a := New("", 0, 0, 0, "")
+	a := New("", 0, 0, 0, "", 0)
 
 	a.CollectRuntimeMetrics()
 	a.CollectRuntimeMetrics()
@@ -196,8 +196,8 @@ func TestCollectRuntimeMetrics(t *testing.T) {
 		t.Fatalf("RandomValue = %v, want value in [0, 1)", got)
 	}
 
-	if got := len(a.metrics.gauges); got != len(models.GaugeMetricNames) {
-		t.Fatalf("gauge metrics count = %d, want %d", got, len(models.GaugeMetricNames))
+	if got := len(a.metrics.gauges); got != len(models.RuntimeGaugeMetricNames) {
+		t.Fatalf("gauge metrics count = %d, want %d", got, len(models.RuntimeGaugeMetricNames))
 	}
 }
 
@@ -206,8 +206,8 @@ func seed(a *Agent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.metrics.gauges = make(map[string]float64, len(models.GaugeMetricNames))
-	for _, name := range models.GaugeMetricNames {
+	a.metrics.gauges = make(map[string]float64, len(models.RuntimeGaugeMetricNames))
+	for _, name := range models.RuntimeGaugeMetricNames {
 		a.metrics.gauges[name] = 0
 	}
 	a.metrics.gauges["Alloc"] = 1.5
@@ -250,7 +250,7 @@ func TestSendMetricsUsesBatches(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, 2*time.Second, 10*time.Second, batchSize, "")
+	a := New(ts.URL, 2*time.Second, 10*time.Second, batchSize, "", 0)
 	a.client = ts.Client()
 	seed(a)
 
@@ -261,7 +261,7 @@ func TestSendMetricsUsesBatches(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	wantMetrics := len(models.GaugeMetricNames) + 1
+	wantMetrics := len(models.RuntimeGaugeMetricNames) + 1
 	wantRequests := (wantMetrics + batchSize - 1) / batchSize
 
 	if len(paths) != wantRequests {
@@ -299,7 +299,7 @@ func TestSendMetricsSkipsEmptyBatch(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0, "")
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 
 	if err := a.SendMetrics(context.Background()); err != nil {
@@ -340,7 +340,7 @@ func TestSendMetricsReturnsCounterDeltaOnFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0, "")
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 	seed(a)
 
@@ -384,7 +384,7 @@ func TestSendBatchesReturnsOnlyUnsentMetrics(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 2, "")
+	a := New(ts.URL, time.Second, time.Second, 2, "", 0)
 	a.client = ts.Client()
 
 	batch := []models.Metrics{
@@ -415,7 +415,7 @@ func TestSendBatchSkipsEmptyPayload(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0, "")
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 
 	if err := a.sendBatch(context.Background(), nil); err != nil {
@@ -441,7 +441,7 @@ func TestNewBatchSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := New("", 0, 0, tt.size, "").batchSize; got != tt.want {
+			if got := New("", 0, 0, tt.size, "", 0).batchSize; got != tt.want {
 				t.Fatalf("batchSize = %d, want %d", got, tt.want)
 			}
 		})
@@ -472,7 +472,7 @@ func TestSendBatchSignsCompressedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0, key)
+	a := New(srv.URL, time.Second, time.Second, 0, key, 0)
 	metrics := []models.Metrics{gaugeMetric("Alloc", 1.5)}
 	if err := a.sendBatch(context.Background(), metrics); err != nil {
 		t.Fatalf("sendBatch() error = %v", err)
@@ -514,7 +514,7 @@ func TestSendBatchWithoutKeyIsUnsigned(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, time.Second, time.Second, 0, "")
+	a := New(srv.URL, time.Second, time.Second, 0, "", 0)
 	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1.5)}); err != nil {
 		t.Fatalf("sendBatch() error = %v", err)
 	}
