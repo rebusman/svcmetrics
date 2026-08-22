@@ -65,6 +65,50 @@ func TestCollectSystemMetrics(t *testing.T) {
 	}
 }
 
+// TestCollectSystemMetricsDropsVanishedCPUs verifies that a reading finding
+// fewer CPUs than the previous one removes the gauges of the CPUs that went
+// away. Without that, a host whose cpuset is narrowed at run time would keep
+// reporting the load those CPUs had at the moment they disappeared.
+//
+// The state is set up by hand rather than by narrowing the real cpuset: the
+// number of CPUs gopsutil reports is not something a test can dictate.
+func TestCollectSystemMetricsDropsVanishedCPUs(t *testing.T) {
+	a := New("", 0, 0, 0, "", 0)
+
+	const vanished = 512
+	a.mu.Lock()
+	for i := 1; i <= vanished; i++ {
+		a.metrics.gauges[models.CPUUtilization(i)] = 100
+	}
+	a.cpuCount = vanished
+	a.mu.Unlock()
+
+	if err := a.CollectSystemMetrics(context.Background()); err != nil {
+		t.Fatalf("CollectSystemMetrics() error = %v", err)
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.cpuCount <= 0 {
+		t.Fatalf("cpuCount = %d, want the number of CPUs just read", a.cpuCount)
+	}
+	if a.cpuCount >= vanished {
+		t.Skipf("the host reports %d CPUs, nothing vanished", a.cpuCount)
+	}
+
+	for i := a.cpuCount + 1; i <= vanished; i++ {
+		if _, ok := a.metrics.gauges[models.CPUUtilization(i)]; ok {
+			t.Errorf("%s outlived the CPU it measured", models.CPUUtilization(i))
+		}
+	}
+	for i := 1; i <= a.cpuCount; i++ {
+		if _, ok := a.metrics.gauges[models.CPUUtilization(i)]; !ok {
+			t.Errorf("%s is missing from the %d CPUs read", models.CPUUtilization(i), a.cpuCount)
+		}
+	}
+}
+
 // TestCollectSystemMetricsLeavesTheCounterAlone verifies that reading the host
 // does not advance PollCount: the counter belongs to the runtime poller, and
 // two collectors bumping it would report twice the polls that happened.

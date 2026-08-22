@@ -88,6 +88,11 @@ type Agent struct {
 	mu               sync.RWMutex
 	metrics          metricState
 	lastSentCounters map[string]int64
+
+	// cpuCount is how many CPUutilization gauges the previous host reading left
+	// in the state, so that a reading finding fewer CPUs can drop the ones that
+	// went away. It is guarded by mu.
+	cpuCount int
 }
 
 // New returns an agent reporting to endpoint. batchSize caps how many metrics
@@ -154,39 +159,45 @@ func (a *Agent) reportError(err error) {
 // The collectors, the reporter and the workers are separate goroutines joined
 // by a single channel of batches. Run drives the reporter itself and blocks,
 // as it did when all of this happened in one loop.
+//
+// The workers and the collectors stop on different signals — the workers when
+// the channel of batches closes, the collectors when the context is cancelled —
+// and neither has to outlive the other. A single [sync.WaitGroup] holds them
+// all, so the two kinds are joined at once rather than one pool after the
+// other, and nothing a worker does delays a collector's completion.
 func (a *Agent) Run(ctx context.Context) {
 	batches := make(chan []models.Metrics)
 
-	var workers sync.WaitGroup
+	var running sync.WaitGroup
 	for range a.rateLimit {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		running.Go(func() {
 			a.work(ctx, batches)
-		}()
-	}
-
-	var collectors sync.WaitGroup
-	collectors.Add(2)
-	go func() {
-		defer collectors.Done()
-		a.poll(ctx, func(context.Context) error {
-			a.CollectRuntimeMetrics()
-			return nil
 		})
-	}()
-	go func() {
-		defer collectors.Done()
+	}
+	running.Go(func() {
+		a.poll(ctx, a.collectRuntime)
+	})
+	running.Go(func() {
 		a.poll(ctx, a.CollectSystemMetrics)
-	}()
+	})
 
 	a.report(ctx, batches)
 
 	// Only the reporter sends, so it is the one that may close the channel;
 	// the workers then finish what they are already holding and stop.
 	close(batches)
-	workers.Wait()
-	collectors.Wait()
+	running.Wait()
+}
+
+// collectRuntime adapts [Agent.CollectRuntimeMetrics] to the signature poll
+// expects, and always returns nil.
+//
+// The collector itself keeps the signature it deserves: reading the runtime
+// statistics cannot fail, and an exported method returning an error that is
+// always nil would be worse than this adapter.
+func (a *Agent) collectRuntime(context.Context) error {
+	a.CollectRuntimeMetrics()
+	return nil
 }
 
 // poll runs collect on every tick of the poll interval until the context is

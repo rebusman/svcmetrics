@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"strconv"
 
@@ -56,36 +57,39 @@ func bodyAllowed(status int) bool {
 	return status != http.StatusNoContent && status != http.StatusNotModified
 }
 
-// signatureAccepted reports whether a request carrying sig may proceed. An
-// absent signature — or the [hashing.NoSignature] placeholder sent in its
-// place — means the client has no key, and the body is taken as it is: a key
-// enables verification for the clients that sign, it does not turn a signature
-// into an authentication requirement for every request. A signature that is
-// present has to match.
-func signatureAccepted(sig string, body []byte, key string) bool {
-	if sig == "" || sig == hashing.NoSignature {
-		return true
-	}
-	return hashing.Equal(sig, body, key)
+// unsigned reports whether sig means the client did not sign the request: an
+// absent signature, or the [hashing.NoSignature] placeholder some clients send
+// in its place. Such a request is taken as it is — a key enables verification
+// for the clients that sign, it does not turn a signature into an
+// authentication requirement for every request.
+func unsigned(sig string) bool {
+	return sig == "" || sig == hashing.NoSignature
 }
 
 // HashMiddleware returns middleware that authenticates request and response
 // bodies with HMAC-SHA256 using key. An empty key disables both verification
 // and signing and returns the supplied handler unchanged.
 //
-// For a non-empty key, the middleware reads the request body as transmitted,
-// before decompression, and compares its digest with [hashing.Header] when the
-// client sent one. A mismatch prevents the next handler from running and
+// For a non-empty key, a request carrying [hashing.Header] is read as
+// transmitted, before decompression, and the digest of the body is compared
+// with the header. A mismatch prevents the next handler from running and
 // produces a [http.StatusBadRequest] response; a body above
-// [maxSignedBodySize] produces [http.StatusRequestEntityTooLarge]. A request
-// without a signature passes through untouched — see [signatureAccepted]. The
-// request body is restored afterwards so downstream handlers read it normally.
+// [maxSignedBodySize] produces [http.StatusRequestEntityTooLarge]. The body is
+// restored afterwards so downstream handlers read it normally.
+//
+// A request without a signature passes through untouched — see [unsigned]. Its
+// body is never read here: there is nothing to verify, so it is left as a
+// stream for the handlers, which neither buffers it nor holds it against
+// [maxSignedBodySize]. That cap bounds what verification has to keep in memory
+// and is not a limit on request size in general.
 //
 // Responses are buffered in full and signed after downstream middleware has
 // finished, so [hashing.Header] describes the exact bytes sent to the client,
 // including compression when enabled. This mirrors the request direction, where
 // the digest also covers the compressed body. Rejection responses are signed as
-// well.
+// well. The buffered headers move to the real [http.ResponseWriter] as they
+// are, without copying the value slices: the buffer is not read again once the
+// response has been written out.
 //
 // Place this middleware outside the compression middleware and inside the
 // logging one: the first keeps the digest over the transmitted bytes, the
@@ -99,23 +103,30 @@ func HashMiddleware(key string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rw := newHashResponseWriter()
 
-			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedBodySize))
-			var tooLarge *http.MaxBytesError
-			switch {
-			case errors.As(err, &tooLarge):
-				http.Error(rw, "Request body too large", http.StatusRequestEntityTooLarge)
-			case err != nil:
-				http.Error(rw, "Failed to read request body", http.StatusBadRequest)
-			case !signatureAccepted(r.Header.Get(hashing.Header), body, key):
-				http.Error(rw, "Invalid request hash", http.StatusBadRequest)
-			default:
-				r.Body = io.NopCloser(bytes.NewReader(body))
+			sig := r.Header.Get(hashing.Header)
+			if unsigned(sig) {
+				// Nothing to verify, so nothing to hold: the body stays the
+				// stream the handlers below read for themselves, and the cap
+				// that bounds a verified body does not apply to it.
 				next.ServeHTTP(rw, r)
+			} else {
+				body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSignedBodySize))
+				var tooLarge *http.MaxBytesError
+				switch {
+				case errors.As(err, &tooLarge):
+					http.Error(rw, "Request body too large", http.StatusRequestEntityTooLarge)
+				case err != nil:
+					http.Error(rw, "Failed to read request body", http.StatusBadRequest)
+				case !hashing.Equal(sig, body, key):
+					http.Error(rw, "Invalid request hash", http.StatusBadRequest)
+				default:
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					next.ServeHTTP(rw, r)
+				}
 			}
 
-			for name, values := range rw.header {
-				w.Header()[name] = append([]string(nil), values...)
-			}
+			maps.Copy(w.Header(), rw.header)
+
 			responseBody := rw.body.Bytes()
 			w.Header().Set(hashing.Header, hashing.Sum(responseBody, key))
 			if bodyAllowed(rw.status) {

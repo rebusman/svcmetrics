@@ -181,6 +181,35 @@ func TestHashMiddlewareRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+// TestHashMiddlewarePassesOversizedUnsignedBody covers the other side of the
+// cap: it bounds what verification buffers, so a request that is not verified
+// must not meet it. The body also has to reach the handler as a stream, unread
+// by the middleware.
+func TestHashMiddlewarePassesOversizedUnsignedBody(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), maxSignedBodySize+1)
+
+	var read int
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			t.Errorf("reading the body in the handler: %v", err)
+		}
+		read = int(n)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	HashMiddleware(testKey)(next).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if read != len(body) {
+		t.Errorf("the handler read %d bytes, want the whole body of %d", read, len(body))
+	}
+}
+
 // TestHashMiddlewareDisabledWithoutKey covers the empty key: the handler has to
 // come back untouched, with no verification and no signature.
 func TestHashMiddlewareDisabledWithoutKey(t *testing.T) {
