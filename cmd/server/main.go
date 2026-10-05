@@ -353,8 +353,9 @@ func main() {
 // newAuditPublisher builds the audit publisher with an observer for every
 // configured receiver: the file at path and the server at rawURL. With neither
 // configured the audit is disabled and the publisher is nil. The returned
-// function drains the queued events and releases the receivers; it is never
-// nil.
+// function drains the queued events and releases the receivers; when the error
+// is nil, the function is never nil, even with the audit disabled. On error
+// nothing is left open and both other results are nil.
 func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publisher, func(), error) {
 	var observers []audit.Observer
 	var fileObserver *audit.FileObserver

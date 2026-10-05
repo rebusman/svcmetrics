@@ -134,6 +134,9 @@ func (p *Publisher) Close(ctx context.Context) error {
 func (p *Publisher) run() {
 	defer close(p.done)
 	for e := range p.queue {
+		// Sharing the backing array without a copy is safe: Register only
+		// appends, which writes past the length of this snapshot or moves to a
+		// new array, and nothing ever changes an element once it is in place.
 		p.mu.RLock()
 		observers := p.observers
 		p.mu.RUnlock()
