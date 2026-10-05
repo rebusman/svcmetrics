@@ -13,10 +13,56 @@ import (
 	"sync"
 )
 
-// gzipRequestBody decompresses a request body and closes both the decompressor
-// and the original body.
-type gzipRequestBody struct {
+// Pools of the decompressors and compressors used by the middleware. A
+// compressor holds several hundred kilobytes of tables and a decompressor tens
+// of kilobytes, so creating them per request dominated the memory the server
+// allocated. A pooled one is always pointed away from the request it served
+// before it goes back, so the pool never pins a request or a connection.
+var (
+	gzipReaderPool sync.Pool // *gzipReader
+	gzipWriterPool = sync.Pool{
+		New: func() any { return gzip.NewWriter(io.Discard) },
+	}
+)
+
+// gzipReader is a pooled decompressor together with the buffered reader it
+// reads through. gzip.Reader.Reset wraps a source that is not an
+// io.ByteReader — and a request body is not — in a fresh bufio.Reader, so
+// keeping that buffer in the pool as well is what makes the reuse free.
+type gzipReader struct {
 	*gzip.Reader
+	buf *bufio.Reader
+}
+
+// getGzipReader returns a pooled decompressor reading r, or the error of a body
+// that does not start with a gzip header.
+func getGzipReader(r io.Reader) (*gzipReader, error) {
+	zr, ok := gzipReaderPool.Get().(*gzipReader)
+	if !ok {
+		zr = &gzipReader{Reader: new(gzip.Reader), buf: bufio.NewReader(r)}
+	} else {
+		zr.buf.Reset(r)
+	}
+	if err := zr.Reset(zr.buf); err != nil {
+		putGzipReader(zr)
+		return nil, err
+	}
+	return zr, nil
+}
+
+// putGzipReader detaches zr from the body it read and returns it to the pool.
+// The decompressor keeps pointing at the buffer, which no longer points at the
+// body; the next user resets both.
+func putGzipReader(zr *gzipReader) {
+	zr.buf.Reset(nil)
+	gzipReaderPool.Put(zr)
+}
+
+// gzipRequestBody decompresses a request body and closes both the decompressor
+// and the original body. Closing it returns the decompressor to the pool, so
+// it must not be read after Close.
+type gzipRequestBody struct {
+	*gzipReader
 	orig io.Closer
 
 	once sync.Once
@@ -26,7 +72,8 @@ type gzipRequestBody struct {
 // Close closes the decompressor and the original body. It is idempotent.
 func (b *gzipRequestBody) Close() error {
 	b.once.Do(func() {
-		b.err = errors.Join(b.Reader.Close(), b.orig.Close())
+		b.err = errors.Join(b.gzipReader.Close(), b.orig.Close())
+		putGzipReader(b.gzipReader)
 	})
 	return b.err
 }
@@ -38,13 +85,13 @@ func (b *gzipRequestBody) Close() error {
 func GzipRequestMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Content-Encoding") == "gzip" {
-			gz, err := gzip.NewReader(r.Body)
+			gz, err := getGzipReader(r.Body)
 			if err != nil {
 				http.Error(w, "Invalid gzip content", http.StatusBadRequest)
 				return
 			}
 
-			body := &gzipRequestBody{Reader: gz, orig: r.Body}
+			body := &gzipRequestBody{gzipReader: gz, orig: r.Body}
 			defer func() {
 				_ = body.Close()
 			}()
@@ -81,12 +128,17 @@ type gzipResponseWriter struct {
 	writer *gzip.Writer
 }
 
-// Close flushes the gzip trailer if anything was compressed.
+// Close flushes the gzip trailer if anything was compressed and returns the
+// compressor to the pool.
 func (grw *gzipResponseWriter) Close() error {
-	if grw.writer != nil {
-		return grw.writer.Close()
+	if grw.writer == nil {
+		return nil
 	}
-	return nil
+	err := grw.writer.Close()
+	grw.writer.Reset(io.Discard)
+	gzipWriterPool.Put(grw.writer)
+	grw.writer = nil
+	return err
 }
 
 // isCompressibleContentType reports whether responses of this content type are
@@ -128,7 +180,8 @@ func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
 	grw.enableCompressionIfNeeded()
 	if grw.shouldCompress() {
 		if grw.writer == nil {
-			grw.writer = gzip.NewWriter(grw.ResponseWriter)
+			grw.writer = gzipWriterPool.Get().(*gzip.Writer)
+			grw.writer.Reset(grw.ResponseWriter)
 		}
 		return grw.writer.Write(b)
 	}

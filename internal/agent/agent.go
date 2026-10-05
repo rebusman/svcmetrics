@@ -16,9 +16,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
-	"maps"
 	"math/rand/v2"
 	"net/http"
 	"runtime"
@@ -67,8 +65,10 @@ type metricState struct {
 // metrics it carries are handed back to the accumulator. It is safe for
 // concurrent use.
 type Agent struct {
-	endpoint string
-	client   *http.Client
+	// updatesURL is the batch endpoint of the server, built once rather than
+	// on every report.
+	updatesURL string
+	client     *http.Client
 
 	pollInterval   time.Duration
 	reportInterval time.Duration
@@ -117,7 +117,7 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 	}
 
 	return &Agent{
-		endpoint:       strings.TrimRight(endpoint, "/"),
+		updatesURL:     strings.TrimRight(endpoint, "/") + "/updates/",
 		client:         &http.Client{Timeout: clientTimeout},
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
@@ -294,46 +294,46 @@ func gaugeCapacity() int {
 }
 
 // CollectRuntimeMetrics reads the runtime memory statistics into the agent's
-// state and advances the poll counter.
+// state and advances the poll counter. The values go straight into the state:
+// an intermediate map would be allocated and thrown away on every poll.
 func (a *Agent) CollectRuntimeMetrics() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-
-	values := map[string]float64{
-		"Alloc":            float64(ms.Alloc),
-		"BuckHashSys":      float64(ms.BuckHashSys),
-		"Frees":            float64(ms.Frees),
-		"GCCPUFraction":    ms.GCCPUFraction,
-		"GCSys":            float64(ms.GCSys),
-		"HeapAlloc":        float64(ms.HeapAlloc),
-		"HeapIdle":         float64(ms.HeapIdle),
-		"HeapInuse":        float64(ms.HeapInuse),
-		"HeapObjects":      float64(ms.HeapObjects),
-		"HeapReleased":     float64(ms.HeapReleased),
-		"HeapSys":          float64(ms.HeapSys),
-		"LastGC":           float64(ms.LastGC),
-		"Lookups":          float64(ms.Lookups),
-		"MCacheInuse":      float64(ms.MCacheInuse),
-		"MCacheSys":        float64(ms.MCacheSys),
-		"MSpanInuse":       float64(ms.MSpanInuse),
-		"MSpanSys":         float64(ms.MSpanSys),
-		"Mallocs":          float64(ms.Mallocs),
-		"NextGC":           float64(ms.NextGC),
-		"NumForcedGC":      float64(ms.NumForcedGC),
-		"NumGC":            float64(ms.NumGC),
-		"OtherSys":         float64(ms.OtherSys),
-		"PauseTotalNs":     float64(ms.PauseTotalNs),
-		"StackInuse":       float64(ms.StackInuse),
-		"StackSys":         float64(ms.StackSys),
-		"Sys":              float64(ms.Sys),
-		"TotalAlloc":       float64(ms.TotalAlloc),
-		models.RandomValue: rand.Float64(),
-	}
+	random := rand.Float64()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	maps.Copy(a.metrics.gauges, values)
+	g := a.metrics.gauges
+	g["Alloc"] = float64(ms.Alloc)
+	g["BuckHashSys"] = float64(ms.BuckHashSys)
+	g["Frees"] = float64(ms.Frees)
+	g["GCCPUFraction"] = ms.GCCPUFraction
+	g["GCSys"] = float64(ms.GCSys)
+	g["HeapAlloc"] = float64(ms.HeapAlloc)
+	g["HeapIdle"] = float64(ms.HeapIdle)
+	g["HeapInuse"] = float64(ms.HeapInuse)
+	g["HeapObjects"] = float64(ms.HeapObjects)
+	g["HeapReleased"] = float64(ms.HeapReleased)
+	g["HeapSys"] = float64(ms.HeapSys)
+	g["LastGC"] = float64(ms.LastGC)
+	g["Lookups"] = float64(ms.Lookups)
+	g["MCacheInuse"] = float64(ms.MCacheInuse)
+	g["MCacheSys"] = float64(ms.MCacheSys)
+	g["MSpanInuse"] = float64(ms.MSpanInuse)
+	g["MSpanSys"] = float64(ms.MSpanSys)
+	g["Mallocs"] = float64(ms.Mallocs)
+	g["NextGC"] = float64(ms.NextGC)
+	g["NumForcedGC"] = float64(ms.NumForcedGC)
+	g["NumGC"] = float64(ms.NumGC)
+	g["OtherSys"] = float64(ms.OtherSys)
+	g["PauseTotalNs"] = float64(ms.PauseTotalNs)
+	g["StackInuse"] = float64(ms.StackInuse)
+	g["StackSys"] = float64(ms.StackSys)
+	g["Sys"] = float64(ms.Sys)
+	g["TotalAlloc"] = float64(ms.TotalAlloc)
+	g[models.RandomValue] = random
+
 	a.metrics.counters[models.PollCount]++
 }
 
@@ -362,22 +362,39 @@ func (a *Agent) SendMetrics(ctx context.Context) error {
 // The gauges are ordered by name rather than by a fixed list, because the
 // CPUutilization gauges are not known until the host has been read; sorting
 // still keeps the batch order stable from one report to the next.
+//
+// The batch is built under the lock directly from the state, with the values
+// its metrics point at held in one slice per kind: no copy of the state and no
+// allocation per metric.
 func (a *Agent) collectBatch() []models.Metrics {
-	gauges, deltas := a.snapshotForReport()
+	a.mu.Lock()
 
-	batch := make([]models.Metrics, 0, len(gauges)+len(deltas))
-	for _, name := range slices.Sorted(maps.Keys(gauges)) {
-		value := gauges[name]
-		batch = append(batch, models.Metrics{ID: name, MType: models.Gauge, Value: &value})
+	gauges := make([]float64, 0, len(a.metrics.gauges))
+	deltas := make([]int64, 0, len(models.CounterMetricNames))
+	batch := make([]models.Metrics, 0, cap(gauges)+cap(deltas))
+
+	for name, value := range a.metrics.gauges {
+		gauges = append(gauges, value)
+		batch = append(batch, models.Metrics{ID: name, MType: models.Gauge, Value: &gauges[len(gauges)-1]})
 	}
+	gaugeCount := len(batch)
+
 	for _, name := range models.CounterMetricNames {
-		delta := deltas[name]
+		current := a.metrics.counters[name]
+		delta := current - a.lastSentCounters[name]
+		a.lastSentCounters[name] = current
 		if delta == 0 {
 			continue
 		}
-		batch = append(batch, models.Metrics{ID: name, MType: models.Counter, Delta: &delta})
+		deltas = append(deltas, delta)
+		batch = append(batch, models.Metrics{ID: name, MType: models.Counter, Delta: &deltas[len(deltas)-1]})
 	}
 
+	a.mu.Unlock()
+
+	slices.SortFunc(batch[:gaugeCount], func(x, y models.Metrics) int {
+		return strings.Compare(x.ID, y.ID)
+	})
 	return batch
 }
 
@@ -408,25 +425,6 @@ func (a *Agent) returnCounters(metrics []models.Metrics) {
 	}
 }
 
-// snapshotForReport copies gauges and computes counter deltas under a single lock,
-// also marking the counters as sent.
-func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	gauges := make(map[string]float64, len(a.metrics.gauges))
-	maps.Copy(gauges, a.metrics.gauges)
-
-	deltas := make(map[string]int64, len(models.CounterMetricNames))
-	for _, name := range models.CounterMetricNames {
-		current := a.metrics.counters[name]
-		deltas[name] = current - a.lastSentCounters[name]
-		a.lastSentCounters[name] = current
-	}
-
-	return gauges, deltas
-}
-
 // sendBatch posts one gzip-compressed batch to /updates/. When the agent has a
 // key, the complete compressed body is signed and the digest goes into
 // [hashing.Header] — the server verifies the request before it decompresses
@@ -441,11 +439,6 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 		return nil
 	}
 
-	body, err := json.Marshal(metrics)
-	if err != nil {
-		return err
-	}
-
 	var buf bytes.Buffer
 	gw := gzipWriterPool.Get().(*gzip.Writer)
 	defer func() {
@@ -454,21 +447,25 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	}()
 	gw.Reset(&buf)
 
-	if _, err := gw.Write(body); err != nil {
+	// The JSON is encoded straight into the compressor, so the uncompressed
+	// body never exists as a whole.
+	if err := json.NewEncoder(gw).Encode(metrics); err != nil {
 		return err
 	}
 	if err := gw.Close(); err != nil {
 		return err
 	}
-	body = buf.Bytes()
+	body := buf.Bytes()
 
-	url := fmt.Sprintf("%s/updates/", a.endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.updatesURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+	// The response body is thrown away unread, so a compressed one would only
+	// cost the server a compressor and the agent a decompressor.
+	req.Header.Set("Accept-Encoding", "identity")
 	if a.key != "" {
 		req.Header.Set(hashing.Header, hashing.Sum(body, a.key))
 	}

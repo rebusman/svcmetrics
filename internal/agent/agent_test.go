@@ -529,3 +529,23 @@ func TestSendBatchWithoutKeyIsUnsigned(t *testing.T) {
 		t.Errorf("signature = %q, want none", sig)
 	}
 }
+
+// TestSendBatchDeclinesCompressedResponse verifies that the agent asks for an
+// uncompressed answer: it never reads the response body, so a compressed one
+// would only cost both sides a gzip coder.
+func TestSendBatchDeclinesCompressedResponse(t *testing.T) {
+	var got atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Get("Accept-Encoding"))
+		_ = readBatch(t, r)
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, time.Second, time.Second, 0, "", 0)
+	if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1)}); err != nil {
+		t.Fatalf("sendBatch error = %v", err)
+	}
+	if got.Load() != "identity" {
+		t.Errorf("Accept-Encoding = %q, want identity", got.Load())
+	}
+}
