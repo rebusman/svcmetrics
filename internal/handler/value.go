@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 )

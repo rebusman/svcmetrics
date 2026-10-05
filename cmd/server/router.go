@@ -5,9 +5,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/sirupsen/logrus"
+
 	"github.com/rebusman/svcmetrics/internal/handler"
 	"github.com/rebusman/svcmetrics/internal/repository"
-	"github.com/sirupsen/logrus"
 )
 
 // requestTimeout bounds the time a single request may spend in a handler. It

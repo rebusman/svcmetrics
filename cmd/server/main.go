@@ -22,12 +22,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/rebusman/svcmetrics/internal/retry"
-	"github.com/sirupsen/logrus"
 )
 
 // responseWriter records the status code, the body size and the first failed

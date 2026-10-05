@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -42,9 +43,7 @@ func serveBench(b *testing.B, h http.Handler, method, target string, body []byte
 	b.Helper()
 
 	r := httptest.NewRequest(method, target, bytes.NewReader(body))
-	for k, v := range header {
-		r.Header[k] = v
-	}
+	maps.Copy(r.Header, header)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {

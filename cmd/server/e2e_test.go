@@ -19,10 +19,11 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	models "github.com/rebusman/svcmetrics/internal/model"
-	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/sirupsen/logrus"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
 var sharedDSN string

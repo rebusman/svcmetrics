@@ -96,11 +96,9 @@ func reportOnce(ctx context.Context, a *Agent) {
 
 	var workers sync.WaitGroup
 	for range a.rateLimit {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			a.work(ctx, batches)
-		}()
+		})
 	}
 
 	a.enqueue(ctx, batches)
