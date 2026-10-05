@@ -16,10 +16,10 @@ import (
 
 func newTestRouter(s repository.Storage) chi.Router {
 	r := chi.NewRouter()
-	r.Post("/update", UpdateJSONHandler(s))
-	r.Post("/updates", UpdatesJSONHandler(s))
-	r.Post("/updates/", UpdatesJSONHandler(s))
-	r.Post("/update/{type}/{name}/{value}", UpdateHandler(s))
+	r.Post("/update", UpdateJSONHandler(s, nil))
+	r.Post("/updates", UpdatesJSONHandler(s, nil))
+	r.Post("/updates/", UpdatesJSONHandler(s, nil))
+	r.Post("/update/{type}/{name}/{value}", UpdateHandler(s, nil))
 	r.Get("/value/{type}/{name}", ValueHandler(s))
 	r.Post("/value", ValueJSONHandler(s))
 	r.Get("/", ListHandler(s))

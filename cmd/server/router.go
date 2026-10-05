@@ -20,13 +20,14 @@ const requestTimeout = 12 * time.Second
 // newRouter builds the HTTP router: the middleware chain plus every metric
 // endpoint. Both /updates and /updates/ are registered because chi treats them
 // as distinct patterns and clients use either. A non-empty key enables
-// verification of request signatures and signing of response bodies.
+// verification of request signatures and signing of response bodies. Stored
+// metrics are reported to auditor, which may be nil.
 //
 // The signature middleware sits between the logger and the compression pair on
 // purpose: outside compression, so the digest covers the bytes that actually
 // travel; inside logging, so a request rejected over a bad signature still
 // reaches the log.
-func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string) chi.Router {
+func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string, auditor handler.Auditor) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
@@ -36,10 +37,10 @@ func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger,
 	r.Use(handler.GzipRequestMiddleware)
 	r.Use(handler.GzipResponseMiddleware)
 
-	r.Post("/update", handler.UpdateJSONHandler(hs))
-	r.Post("/updates", handler.UpdatesJSONHandler(hs))
-	r.Post("/updates/", handler.UpdatesJSONHandler(hs))
-	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(hs))
+	r.Post("/update", handler.UpdateJSONHandler(hs, auditor))
+	r.Post("/updates", handler.UpdatesJSONHandler(hs, auditor))
+	r.Post("/updates/", handler.UpdatesJSONHandler(hs, auditor))
+	r.Post("/update/{type}/{name}/{value}", handler.UpdateHandler(hs, auditor))
 	r.Get("/value/{type}/{name}", handler.ValueHandler(hs))
 	r.Post("/value", handler.ValueJSONHandler(hs))
 	r.Get("/ping", handler.PingHandler(pinger))

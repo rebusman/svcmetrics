@@ -1,0 +1,236 @@
+package audit
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+)
+
+// recorder is an observer that remembers what it received.
+type recorder struct {
+	mu     sync.Mutex
+	events []Event
+	err    error
+}
+
+func (r *recorder) Name() string { return "recorder" }
+
+func (r *recorder) Update(_ context.Context, e Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+	return r.err
+}
+
+func (r *recorder) received() []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Event(nil), r.events...)
+}
+
+func closePublisher(t *testing.T, p *Publisher) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestEventJSON(t *testing.T) {
+	e := NewEvent(time.Unix(12345678, 0), []string{"Alloc", "Frees"}, "192.168.0.42")
+
+	got, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"ts":12345678,"metrics":["Alloc","Frees"],"ip_address":"192.168.0.42"}`
+	if string(got) != want {
+		t.Errorf("json = %s, want %s", got, want)
+	}
+}
+
+func TestPublisherNotifiesEveryObserverInOrder(t *testing.T) {
+	p := NewPublisher(nil)
+	first, second := &recorder{}, &recorder{}
+	p.Register(first)
+	p.Register(second)
+
+	events := []Event{
+		NewEvent(time.Unix(1, 0), []string{"Alloc"}, "10.0.0.1"),
+		NewEvent(time.Unix(2, 0), []string{"PollCount"}, "10.0.0.2"),
+	}
+	for _, e := range events {
+		p.Notify(context.Background(), e)
+	}
+	closePublisher(t, p)
+
+	for _, o := range []*recorder{first, second} {
+		if got := o.received(); !reflect.DeepEqual(got, events) {
+			t.Errorf("received %+v, want %+v", got, events)
+		}
+	}
+}
+
+func TestPublisherReportsObserverFailure(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		reported []string
+	)
+	p := NewPublisher(func(observer string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, observer+": "+err.Error())
+	})
+	failing := &recorder{err: errors.New("boom")}
+	healthy := &recorder{}
+	p.Register(failing)
+	p.Register(healthy)
+
+	p.Notify(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
+	closePublisher(t, p)
+
+	if want := []string{"recorder: boom"}; !reflect.DeepEqual(reported, want) {
+		t.Errorf("reported %q, want %q", reported, want)
+	}
+	if len(healthy.received()) != 1 {
+		t.Error("a failing observer kept the event from the next one")
+	}
+}
+
+func TestPublisherIgnoresEventsAfterClose(t *testing.T) {
+	p := NewPublisher(nil)
+	o := &recorder{}
+	p.Register(o)
+	closePublisher(t, p)
+
+	p.Notify(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
+	closePublisher(t, p)
+
+	if got := o.received(); len(got) != 0 {
+		t.Errorf("received %+v after Close, want nothing", got)
+	}
+}
+
+func TestFileObserverAppendsLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(path, []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o, err := NewFileObserver(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []Event{
+		NewEvent(time.Unix(1, 0), []string{"Alloc", "Frees"}, "10.0.0.1"),
+		NewEvent(time.Unix(2, 0), []string{"PollCount"}, "10.0.0.2"),
+	}
+	for _, e := range events {
+		if err := o.Update(context.Background(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() || scanner.Text() != "existing" {
+		t.Fatalf("first line = %q, want the existing content kept", scanner.Text())
+	}
+	for i, want := range events {
+		if !scanner.Scan() {
+			t.Fatalf("line %d missing", i+2)
+		}
+		var got Event
+		if err := json.Unmarshal(scanner.Bytes(), &got); err != nil {
+			t.Fatalf("line %d: %v", i+2, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("line %d = %+v, want %+v", i+2, got, want)
+		}
+	}
+	if scanner.Scan() {
+		t.Errorf("unexpected line %q", scanner.Text())
+	}
+}
+
+func TestNewFileObserverFailsOnBadPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "audit.log")
+	if _, err := NewFileObserver(path); err == nil {
+		t.Error("NewFileObserver succeeded for a path in a missing directory")
+	}
+}
+
+func TestHTTPObserverPostsEvent(t *testing.T) {
+	var (
+		method, contentType string
+		got                 Event
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		contentType = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &got)
+	}))
+	defer srv.Close()
+
+	o, err := NewHTTPObserver(srv.URL+"/audit", srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := NewEvent(time.Unix(12345678, 0), []string{"Alloc"}, "192.168.0.42")
+	if err := o.Update(context.Background(), want); err != nil {
+		t.Fatal(err)
+	}
+
+	if method != http.MethodPost {
+		t.Errorf("method = %s, want POST", method)
+	}
+	if contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", contentType)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("received %+v, want %+v", got, want)
+	}
+}
+
+func TestHTTPObserverFailsOnErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	o, err := NewHTTPObserver(srv.URL, srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Update(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1")); err == nil {
+		t.Error("Update succeeded on a 500 answer")
+	}
+}
+
+func TestNewHTTPObserverRejectsBadURL(t *testing.T) {
+	for _, raw := range []string{"", "localhost:8080/audit", "ftp://example.com", "http://", "://bad"} {
+		if _, err := NewHTTPObserver(raw, nil); err == nil {
+			t.Errorf("NewHTTPObserver(%q) succeeded", raw)
+		}
+	}
+}

@@ -47,7 +47,7 @@ func newMockedServerWithKey(t *testing.T, key string) (*mocks.MockStorage, *mock
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 
-	return storage, pinger, newRouter(log, storage, pinger, key), &logged
+	return storage, pinger, newRouter(log, storage, pinger, key, nil), &logged
 }
 
 // TestRouterSendsBatchToStorage verifies that both spellings of the batch path

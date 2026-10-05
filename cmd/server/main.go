@@ -1,9 +1,11 @@
 // Command server serves the metrics HTTP API and persists the metrics in
 // PostgreSQL, in a JSON file or in memory. Settings come from flags and are
 // overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE,
-// DATABASE_DSN and KEY environment variables. When KEY is non-empty, the
-// server verifies request bodies and signs response bodies with HMAC-SHA256
-// using the HashSHA256 HTTP header.
+// DATABASE_DSN, KEY, AUDIT_FILE and AUDIT_URL environment variables. When KEY
+// is non-empty, the server verifies request bodies and signs response bodies
+// with HMAC-SHA256 using the HashSHA256 HTTP header. AUDIT_FILE and AUDIT_URL
+// each enable a receiver of the audit log, which records the names of the
+// stored metrics together with the time and the client address.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
@@ -177,6 +180,8 @@ func main() {
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
 	key := flag.String("k", "", "key for signing request and response bodies")
+	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
+	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
 	flag.Parse()
 
 	log := logrus.New()
@@ -213,6 +218,23 @@ func main() {
 	}
 	if envKey := os.Getenv("KEY"); envKey != "" {
 		*key = envKey
+	}
+	if envAuditFile := os.Getenv("AUDIT_FILE"); envAuditFile != "" {
+		*auditFile = envAuditFile
+	}
+	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
+		*auditURL = envAuditURL
+	}
+
+	publisher, closeAudit, err := newAuditPublisher(log, *auditFile, *auditURL)
+	if err != nil {
+		log.Fatalf("Failed to initialize audit: %v", err)
+	}
+	// A nil *audit.Publisher stored in the interface would not compare equal
+	// to nil, so the handlers get a plain nil when the audit is disabled.
+	var auditor handler.Auditor
+	if publisher != nil {
+		auditor = publisher
 	}
 
 	var (
@@ -265,7 +287,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key)
+	r := newRouter(log, hs, pinger, *key, auditor)
 
 	// The write timeout sits above requestTimeout on purpose: the router gives
 	// up on a request first and answers 504, and the connection is only dropped
@@ -304,11 +326,17 @@ func main() {
 	<-ctx.Done()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err := srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
 	cancel()
 	if err != nil {
 		log.Errorf("Server shutdown failed: %v", err)
 	}
+
+	// The server no longer accepts requests, so no new events can appear:
+	// try to deliver the queued ones before the process exits. The attempt is
+	// bounded, so with a slow receiver the rest of the queue is lost, and
+	// closeAudit logs that.
+	closeAudit()
 
 	if fileStore != nil {
 		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -317,6 +345,67 @@ func main() {
 		}
 		cancel()
 	}
+}
+
+// newAuditPublisher builds the audit publisher with an observer for every
+// configured receiver: the file at path and the server at rawURL. With neither
+// configured the audit is disabled and the publisher is nil. The returned
+// function drains the queued events and releases the receivers; it is never
+// nil.
+func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publisher, func(), error) {
+	var observers []audit.Observer
+	var fileObserver *audit.FileObserver
+
+	if path != "" {
+		o, err := audit.NewFileObserver(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		fileObserver = o
+		observers = append(observers, o)
+		log.Infof("Audit log written to %s", path)
+	}
+
+	if rawURL != "" {
+		o, err := audit.NewHTTPObserver(rawURL, nil)
+		if err != nil {
+			if fileObserver != nil {
+				_ = fileObserver.Close()
+			}
+			return nil, nil, err
+		}
+		observers = append(observers, o)
+		log.Infof("Audit log sent to %s", rawURL)
+	}
+
+	if len(observers) == 0 {
+		return nil, func() {}, nil
+	}
+
+	publisher := audit.NewPublisher(func(observer string, err error) {
+		if observer == "" {
+			log.Errorf("Audit event lost: %v", err)
+			return
+		}
+		log.Errorf("Failed to deliver audit event to %s: %v", observer, err)
+	})
+	for _, o := range observers {
+		publisher.Register(o)
+	}
+
+	closeAudit := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := publisher.Close(ctx); err != nil {
+			log.Errorf("Failed to flush audit events: %v", err)
+		}
+		if fileObserver != nil {
+			if err := fileObserver.Close(); err != nil {
+				log.Errorf("Failed to close audit file: %v", err)
+			}
+		}
+	}
+	return publisher, closeAudit, nil
 }
 
 // retryLogger adapts log to [retry.OnRetry], naming the operation being
