@@ -17,10 +17,11 @@ type FileObserver struct {
 var _ Observer = (*FileObserver)(nil)
 
 // NewFileObserver opens path for appending, creating the file when it does not
-// exist. Opening it up front makes a wrong path fail at startup rather than
-// with the first request.
+// exist. A new file is readable by the owner only, since it records client
+// addresses; an existing file keeps its permissions. Opening it up front makes
+// a wrong path fail at startup rather than with the first request.
 func NewFileObserver(path string) (*FileObserver, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open audit file: %w", err)
 	}

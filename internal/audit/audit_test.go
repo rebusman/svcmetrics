@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +169,9 @@ func TestFileObserverAppendsLines(t *testing.T) {
 			t.Errorf("line %d = %+v, want %+v", i+2, got, want)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if scanner.Scan() {
 		t.Errorf("unexpected line %q", scanner.Text())
 	}
@@ -231,6 +236,38 @@ func TestNewHTTPObserverRejectsBadURL(t *testing.T) {
 	for _, raw := range []string{"", "localhost:8080/audit", "ftp://example.com", "http://", "://bad"} {
 		if _, err := NewHTTPObserver(raw, nil); err == nil {
 			t.Errorf("NewHTTPObserver(%q) succeeded", raw)
+		}
+	}
+}
+
+func TestHTTPObserverKeepsSecretsOutOfNameAndErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := srv.URL
+	srv.Close() // nothing listens any more, so the delivery fails
+
+	u, err := url.Parse(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("user", "s3cret-pass")
+	u.Path = "/hook/s3cret-path"
+	u.RawQuery = "token=s3cret-query"
+
+	o, err := NewHTTPObserver(u.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = o.Update(context.Background(), Event{})
+	if err == nil {
+		t.Fatal("Update succeeded with no server listening")
+	}
+
+	for _, got := range []string{o.Name(), err.Error()} {
+		if strings.Contains(got, "s3cret") || strings.Contains(got, "user") {
+			t.Errorf("%q leaks a part of the URL", got)
+		}
+		if !strings.Contains(got, addr) {
+			t.Errorf("%q does not name %s", got, addr)
 		}
 	}
 }

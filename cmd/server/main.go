@@ -325,7 +325,10 @@ func main() {
 
 	<-ctx.Done()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Wait past the router's request deadline: a handler still running when
+	// Shutdown gives up could store metrics after the audit is closed and the
+	// storage is saved below, and both would miss them.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), requestTimeout+3*time.Second)
 	err = srv.Shutdown(shutdownCtx)
 	cancel()
 	if err != nil {
@@ -375,7 +378,7 @@ func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publishe
 			return nil, nil, err
 		}
 		observers = append(observers, o)
-		log.Infof("Audit log sent to %s", rawURL)
+		log.Infof("Audit log sent to %s", o.Name())
 	}
 
 	if len(observers) == 0 {

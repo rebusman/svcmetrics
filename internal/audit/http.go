@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,9 @@ import (
 type HTTPObserver struct {
 	url    string
 	client *http.Client
+	// safeURL is url without userinfo, path and query, which may carry
+	// credentials or tokens; it is the only form of the URL put in errors.
+	safeURL string
 }
 
 var _ Observer = (*HTTPObserver)(nil)
@@ -33,11 +37,13 @@ func NewHTTPObserver(rawURL string, client *http.Client) (*HTTPObserver, error) 
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &HTTPObserver{url: rawURL, client: client}, nil
+	safeURL := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	return &HTTPObserver{url: rawURL, client: client, safeURL: safeURL}, nil
 }
 
-// Name returns the URL events are sent to.
-func (o *HTTPObserver) Name() string { return "url " + o.url }
+// Name returns the scheme and host events are sent to. The rest of the URL is
+// left out, since it may hold credentials or tokens and Name ends up in logs.
+func (o *HTTPObserver) Name() string { return "url " + o.safeURL }
 
 // Update posts the event and treats any status other than 2xx as a failure.
 func (o *HTTPObserver) Update(ctx context.Context, e Event) error {
@@ -48,13 +54,13 @@ func (o *HTTPObserver) Update(ctx context.Context, e Event) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build audit request: %w", err)
+		return fmt.Errorf("build audit request: %w", o.redact(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := o.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send audit event: %w", err)
+		return fmt.Errorf("send audit event: %w", o.redact(err))
 	}
 	defer resp.Body.Close()
 	// Draining the body lets the client reuse the connection.
@@ -64,4 +70,14 @@ func (o *HTTPObserver) Update(ctx context.Context, e Event) error {
 		return fmt.Errorf("send audit event: unexpected status %s", resp.Status)
 	}
 	return nil
+}
+
+// redact replaces the URL that the http package puts in its errors with the
+// safe form, keeping the rest of the error intact.
+func (o *HTTPObserver) redact(err error) error {
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		return err
+	}
+	return &url.Error{Op: uerr.Op, URL: o.safeURL, Err: uerr.Err}
 }
