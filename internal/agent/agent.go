@@ -30,7 +30,7 @@ import (
 	"github.com/rebusman/svcmetrics/internal/retry"
 )
 
-// Defaults applied by New when the caller leaves a setting unset.
+// Defaults applied by [New] when the caller leaves a setting unset.
 const (
 	defaultServerAddress  = "http://localhost:8080"
 	defaultPollInterval   = 2 * time.Second
@@ -430,7 +430,7 @@ func (a *Agent) returnCounters(metrics []models.Metrics) {
 // [hashing.Header] — the server verifies the request before it decompresses
 // it, so the JSON behind the gzip is the wrong thing to sign. An empty batch is
 // never sent. The
-// compressor comes from a pool and is pointed back at io.Discard before it is
+// compressor comes from a pool and is pointed back at [io.Discard] before it is
 // returned, so a pooled writer never pins the payload it compressed; the
 // response body is drained so the transport can reuse the connection for the
 // next batch.

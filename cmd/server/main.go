@@ -1,11 +1,38 @@
-// Command server serves the metrics HTTP API and persists the metrics in
-// PostgreSQL, in a JSON file or in memory. Settings come from flags and are
-// overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE,
-// DATABASE_DSN, KEY, AUDIT_FILE and AUDIT_URL environment variables. When KEY
-// is non-empty, the server verifies request bodies and signs response bodies
-// with HMAC-SHA256 using the HashSHA256 HTTP header. AUDIT_FILE and AUDIT_URL
-// each enable a receiver of the audit log, which records the names of the
-// stored metrics together with the time and the client address.
+// Server serves the metrics HTTP API and keeps the metrics in PostgreSQL, in
+// a JSON file or in memory. The endpoints are described in
+// [github.com/rebusman/svcmetrics/internal/handler].
+//
+// Usage:
+//
+//	server [flags]
+//
+// Every setting comes from a flag, and an environment variable that is set
+// overrides it:
+//
+//	-a           ADDRESS            address to listen on (localhost:8080)
+//	-i           STORE_INTERVAL     seconds between saves to the file, 0 to save
+//	                                on every update (300)
+//	-f           FILE_STORAGE_PATH  file the metrics are saved to
+//	                                (metrics_storage.json)
+//	-r           RESTORE            load the file on startup (false)
+//	-d           DATABASE_DSN       PostgreSQL connection string; when set, the
+//	                                metrics live in the database and the file is
+//	                                not used
+//	-k           KEY                key for HMAC-SHA256 signatures
+//	-audit-file  AUDIT_FILE         file the audit log is appended to
+//	-audit-url   AUDIT_URL          URL the audit events are posted to
+//
+// The storage is PostgreSQL when a DSN is given, the file when its path is
+// non-empty and memory alone otherwise.
+//
+// With a key, the server verifies the signature of every signed request body
+// and signs every response body; the digest travels in the HashSHA256 header.
+// Each audit receiver that is configured gets an event for every request
+// whose metrics were stored: their names, the time and the client address.
+//
+// SIGINT and SIGTERM stop the server gracefully: it lets the requests in
+// flight finish, delivers the queued audit events and saves the metrics to the
+// file before it exits.
 package main
 
 import (
@@ -354,9 +381,12 @@ func main() {
 // newAuditPublisher builds the audit publisher with an observer for every
 // configured receiver: the file at path and the server at rawURL. With neither
 // configured the audit is disabled and the publisher is nil. The returned
-// function drains the queued events and releases the receivers; when the error
-// is nil, the function is never nil, even with the audit disabled. On error
-// nothing is left open and both other results are nil.
+// function drains the queued events, within a bound, and then releases the
+// receivers; a drain that runs out of time leaves the audit file open for the
+// process exit to close, since a write still in progress could otherwise hold
+// up the shutdown for good. When the error is nil, the function is never nil,
+// even with the audit disabled. On error nothing is left open and both other
+// results are nil.
 func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publisher, func(), error) {
 	var observers []audit.Observer
 	var fileObserver *audit.FileObserver
@@ -402,7 +432,11 @@ func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publishe
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := publisher.Close(ctx); err != nil {
+			// Delivery is still running, possibly stuck in a write to the
+			// file that holds the observer's lock, which Close would wait on
+			// without a bound. The file is left to the process exit to close.
 			log.Errorf("Failed to flush audit events: %v", err)
+			return
 		}
 		if fileObserver != nil {
 			if err := fileObserver.Close(); err != nil {

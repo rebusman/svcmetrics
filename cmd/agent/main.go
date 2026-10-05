@@ -1,9 +1,26 @@
-// Command agent collects runtime and host metrics and reports them to the
-// metrics server. Settings come from flags and are overridden by the ADDRESS,
-// REPORT_INTERVAL, POLL_INTERVAL, BATCH_SIZE, RATE_LIMIT and KEY environment
-// variables. RATE_LIMIT caps how many reports may be in flight at once. When
-// KEY is non-empty, every request body is signed with HMAC-SHA256 and the
-// hexadecimal digest is sent in the HashSHA256 header.
+// Agent collects runtime and host metrics and reports them to the metrics
+// server in gzip-compressed batches. The collection and reporting are
+// described in [github.com/rebusman/svcmetrics/internal/agent].
+//
+// Usage:
+//
+//	agent [flags]
+//
+// Every setting comes from a flag, and an environment variable that is set
+// overrides it:
+//
+//	-a  ADDRESS          server address; http:// is assumed without a scheme
+//	                     (localhost:8080)
+//	-p  POLL_INTERVAL    seconds between metric reads (2)
+//	-r  REPORT_INTERVAL  seconds between reports (10)
+//	-b  BATCH_SIZE       metrics per request (32)
+//	-l  RATE_LIMIT       requests in flight at once (1)
+//	-k  KEY              key for HMAC-SHA256 signatures
+//
+// With a key, every request body is signed as sent, after compression, and the
+// hexadecimal digest travels in the HashSHA256 header.
+//
+// SIGINT and SIGTERM stop the agent.
 package main
 
 import (

@@ -271,3 +271,110 @@ func TestHTTPObserverKeepsSecretsOutOfNameAndErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestNewHTTPObserverKeepsSecretsOutOfValidationErrors(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:s3cret/hook",                         // missing @: the password reads as a port
+		"ftp://user:s3cret@example.com/hook?token=s3cret", // wrong scheme
+		"http://user:s3cret@exa mple.com/",                // invalid host
+		"http://example.com/s3cret\x7f",                   // control character
+		"/hook/s3cret?token=s3cret",                       // relative
+	} {
+		_, err := NewHTTPObserver(raw, nil)
+		if !errors.Is(err, ErrInvalidURL) {
+			t.Errorf("NewHTTPObserver(%q) error = %v, want ErrInvalidURL", raw, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "user") {
+			t.Errorf("NewHTTPObserver(%q) error %q leaks a part of the URL", raw, err)
+		}
+	}
+}
+
+// gatedObserver blocks every delivery until its gate is closed.
+type gatedObserver struct{ gate chan struct{} }
+
+func (o gatedObserver) Name() string { return "gated" }
+
+func (o gatedObserver) Update(ctx context.Context, _ Event) error {
+	select {
+	case <-o.gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// TestPublisherCallsOnErrorWithoutLock checks that the callback for a dropped
+// event may use the publisher: run under the publisher's lock, the Register
+// below would wait on that lock forever.
+func TestPublisherCallsOnErrorWithoutLock(t *testing.T) {
+	gate := make(chan struct{})
+
+	var p *Publisher
+	dropped := make(chan struct{}, 1)
+	p = NewPublisher(func(observer string, err error) {
+		if observer == "" && errors.Is(err, ErrQueueFull) {
+			p.Register(gatedObserver{gate: gate})
+			select {
+			case dropped <- struct{}{}:
+			default:
+			}
+		}
+	})
+	p.Register(gatedObserver{gate: gate})
+
+	// One event is held by the blocked delivery, queueSize fill the queue and
+	// the last one has nowhere to go.
+	notified := make(chan struct{})
+	go func() {
+		defer close(notified)
+		for range queueSize + 2 {
+			p.Notify(context.Background(), Event{})
+		}
+	}()
+
+	select {
+	case <-notified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Notify deadlocked in the OnError callback")
+	}
+	select {
+	case <-dropped:
+	default:
+		t.Fatal("no event was reported as dropped")
+	}
+
+	close(gate)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPublisherRegisterAffectsLaterEventsOnly checks the boundary Register
+// promises: an event published before an observer was registered never
+// reaches it, even when it is still waiting in the queue at that moment.
+func TestPublisherRegisterAffectsLaterEventsOnly(t *testing.T) {
+	gate := make(chan struct{})
+	p := NewPublisher(nil)
+	p.Register(gatedObserver{gate: gate})
+
+	// The first event holds up the delivery, so the second is still queued
+	// when the recorder joins.
+	p.Notify(context.Background(), Event{TS: 1})
+	p.Notify(context.Background(), Event{TS: 2})
+
+	late := &recorder{}
+	p.Register(late)
+	p.Notify(context.Background(), Event{TS: 3})
+
+	close(gate)
+	closePublisher(t, p)
+
+	got := late.received()
+	if len(got) != 1 || got[0].TS != 3 {
+		t.Errorf("late observer received %+v, want only the event published after it joined", got)
+	}
+}

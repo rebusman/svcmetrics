@@ -71,9 +71,21 @@ type Publisher struct {
 	observers []Observer
 	closed    bool
 
-	queue   chan Event
+	queue   chan delivery
 	done    chan struct{}
 	onError OnError
+}
+
+// delivery is a queued event together with the observers registered when it
+// was published, which are the ones that receive it.
+//
+// The observers share the backing array of Publisher.observers rather than
+// copying it, which is safe: Register only appends, which writes past the
+// length of this slice or moves to a new array, and nothing ever changes an
+// element once it is in place.
+type delivery struct {
+	event     Event
+	observers []Observer
 }
 
 // NewPublisher starts a publisher with no observers. onError may be nil.
@@ -82,7 +94,7 @@ func NewPublisher(onError OnError) *Publisher {
 		onError = func(string, error) {}
 	}
 	p := &Publisher{
-		queue:   make(chan Event, queueSize),
+		queue:   make(chan delivery, queueSize),
 		done:    make(chan struct{}),
 		onError: onError,
 	}
@@ -90,7 +102,9 @@ func NewPublisher(onError OnError) *Publisher {
 	return p
 }
 
-// Register adds an observer that receives every event published from now on.
+// Register adds an observer that receives every event published from now on:
+// an event already queued by [Publisher.Notify] keeps the observers it was
+// published to.
 func (p *Publisher) Register(o Observer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -100,15 +114,25 @@ func (p *Publisher) Register(o Observer) {
 // Notify queues an event for every observer. It never blocks: when the queue is
 // full the event is dropped and reported through [OnError]. Events published
 // after [Publisher.Close] are ignored.
+//
+// The lock only guards the send, which must not race with Close closing the
+// queue; [OnError] runs after it is released, so a callback is free to use
+// the publisher and a slow one does not hold up Close.
 func (p *Publisher) Notify(_ context.Context, e Event) {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	if p.closed {
+		p.mu.RUnlock()
 		return
 	}
+	var dropped bool
 	select {
-	case p.queue <- e:
+	case p.queue <- delivery{event: e, observers: p.observers}:
 	default:
+		dropped = true
+	}
+	p.mu.RUnlock()
+
+	if dropped {
 		p.onError("", ErrQueueFull)
 	}
 }
@@ -133,17 +157,10 @@ func (p *Publisher) Close(ctx context.Context) error {
 
 func (p *Publisher) run() {
 	defer close(p.done)
-	for e := range p.queue {
-		// Sharing the backing array without a copy is safe: Register only
-		// appends, which writes past the length of this snapshot or moves to a
-		// new array, and nothing ever changes an element once it is in place.
-		p.mu.RLock()
-		observers := p.observers
-		p.mu.RUnlock()
-
-		for _, o := range observers {
+	for d := range p.queue {
+		for _, o := range d.observers {
 			ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
-			if err := o.Update(ctx, e); err != nil {
+			if err := o.Update(ctx, d.event); err != nil {
 				p.onError(o.Name(), err)
 			}
 			cancel()

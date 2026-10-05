@@ -99,5 +99,3 @@ go test -run '^$' -bench BenchmarkAgentReport -benchmem -benchtime 2000x     -me
 ```
 go tool pprof -top -diff_base=profiles/base.pprof profiles/result.pprof
 ```
-
-`

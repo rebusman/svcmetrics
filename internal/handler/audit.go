@@ -12,6 +12,9 @@ import (
 // Auditor receives an event for every request whose metrics were stored. It is
 // satisfied by [audit.Publisher]; a nil Auditor disables the audit.
 type Auditor interface {
+	// Notify hands over the event for a request whose metrics were stored. It
+	// must not block the request: delivery problems are the auditor's to
+	// handle and never fail the request.
 	Notify(ctx context.Context, e audit.Event)
 }
 

@@ -33,8 +33,11 @@ func newHashResponseWriter() *hashResponseWriter {
 	return &hashResponseWriter{header: make(http.Header), status: http.StatusOK}
 }
 
+// Header returns the buffered response headers.
 func (w *hashResponseWriter) Header() http.Header { return w.header }
 
+// WriteHeader records the status; only the first call counts, as with a real
+// [http.ResponseWriter].
 func (w *hashResponseWriter) WriteHeader(status int) {
 	if w.wroteHeader {
 		return
@@ -43,6 +46,7 @@ func (w *hashResponseWriter) WriteHeader(status int) {
 	w.wroteHeader = true
 }
 
+// Write appends p to the buffered body, recording status 200 if none was set.
 func (w *hashResponseWriter) Write(p []byte) (int, error) {
 	w.WriteHeader(http.StatusOK)
 	return w.body.Write(p)

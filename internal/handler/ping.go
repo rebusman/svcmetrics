@@ -11,6 +11,8 @@ import (
 // Pinger reports whether the backing database is reachable. Only the
 // PostgreSQL storage implements it.
 type Pinger interface {
+	// PingContext checks the connection to the database within ctx and
+	// returns nil if it is alive.
 	PingContext(ctx context.Context) error
 }
 

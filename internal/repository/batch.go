@@ -19,7 +19,7 @@ type batchKey struct {
 // gauges keep the last value, counter deltas are summed. The result is sorted
 // by (type, name) so that every storage writes the metrics in the same order —
 // two concurrent transactions then take the row locks in the same sequence and
-// cannot deadlock on each other. It returns models.ErrInvalidMetric for a
+// cannot deadlock on each other. It returns [models.ErrInvalidMetric] for a
 // metric without an ID, of an unknown type or without the value its type
 // requires.
 //

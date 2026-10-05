@@ -91,8 +91,13 @@ var CounterMetricNames = []string{PollCount}
 // are pointers so that an unset field stays distinguishable from a stored zero
 // and is left out of the JSON encoding.
 type Metrics struct {
-	ID    string   `json:"id"`
-	MType string   `json:"type"`
-	Delta *int64   `json:"delta,omitempty"`
+	// ID is the metric name.
+	ID string `json:"id"`
+	// MType is the metric type: [Gauge] or [Counter].
+	MType string `json:"type"`
+	// Delta is the counter increment in a request and the running total in a
+	// response. It is set for counters only.
+	Delta *int64 `json:"delta,omitempty"`
+	// Value is the gauge value. It is set for gauges only.
 	Value *float64 `json:"value,omitempty"`
 }

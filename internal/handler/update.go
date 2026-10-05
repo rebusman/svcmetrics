@@ -1,5 +1,25 @@
 // Package handler implements the HTTP handlers of the metrics server together
-// with the gzip middleware they rely on.
+// with the middleware they rely on.
+//
+// The endpoints, as the server mounts them:
+//
+//	POST /update/{type}/{name}/{value}  store one metric given in the path   [UpdateHandler]
+//	POST /update                        store one metric given in JSON       [UpdateJSONHandler]
+//	POST /updates/                      store a JSON batch atomically        [UpdatesJSONHandler]
+//	GET  /value/{type}/{name}           read one metric as plain text        [ValueHandler]
+//	POST /value                         read one metric as JSON              [ValueJSONHandler]
+//	GET  /                              list every metric as an HTML page    [ListHandler]
+//	GET  /ping                          check the database connection        [PingHandler]
+//
+// A metric type is "gauge" or "counter"; the JSON form is [models.Metrics].
+// Storage errors map to statuses the same way everywhere: 404 for an unknown
+// metric, 400 for a malformed one, 504 for a request past its deadline and 500
+// for anything else.
+//
+// [GzipRequestMiddleware] and [GzipResponseMiddleware] compress the traffic,
+// [HashMiddleware] verifies request signatures and signs responses, and a
+// non-nil [Auditor] is told about every stored metric. The examples show each
+// endpoint at work.
 package handler
 
 import (

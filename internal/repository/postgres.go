@@ -14,7 +14,7 @@ import (
 )
 
 // PgStorage stores metrics in PostgreSQL. Every method is safe for concurrent
-// use: the underlying *sql.DB manages the connection pool.
+// use: the underlying [sql.DB] manages the connection pool.
 //
 // A call that fails with a retriable error — a lost connection, a server that
 // is restarting, two batches deadlocking — is repeated on the schedule of
@@ -183,11 +183,11 @@ type commitError struct {
 // Error returns the message of the failure that broke the commit.
 func (e *commitError) Error() string { return e.err.Error() }
 
-// Unwrap returns the failure that broke the commit, so that errors.Is and
-// errors.As still see the driver error underneath the marker.
+// Unwrap returns the failure that broke the commit, so that [errors.Is] and
+// [errors.As] still see the driver error underneath the marker.
 func (e *commitError) Unwrap() error { return e.err }
 
-// GetGauge returns the stored gauge, or models.ErrNotFound if it is absent.
+// GetGauge returns the stored gauge, or [models.ErrNotFound] if it is absent.
 func (s *PgStorage) GetGauge(ctx context.Context, name string) (float64, error) {
 	value, err := retry.DoValue(ctx, s.retry, func(ctx context.Context) (sql.NullFloat64, error) {
 		var value sql.NullFloat64
@@ -207,7 +207,7 @@ func (s *PgStorage) GetGauge(ctx context.Context, name string) (float64, error) 
 	return value.Float64, nil
 }
 
-// GetCounter returns the stored counter, or models.ErrNotFound if it is absent.
+// GetCounter returns the stored counter, or [models.ErrNotFound] if it is absent.
 func (s *PgStorage) GetCounter(ctx context.Context, name string) (int64, error) {
 	delta, err := retry.DoValue(ctx, s.retry, func(ctx context.Context) (sql.NullInt64, error) {
 		var delta sql.NullInt64

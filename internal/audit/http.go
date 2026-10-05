@@ -22,17 +22,22 @@ type HTTPObserver struct {
 
 var _ Observer = (*HTTPObserver)(nil)
 
+// ErrInvalidURL reports an audit URL that is not an absolute http or https URL.
+var ErrInvalidURL = errors.New("audit URL must be an absolute http or https URL")
+
 // NewHTTPObserver checks that rawURL is an absolute http or https URL, so that
 // a typo fails at startup rather than with the first request. A nil client
 // means [http.DefaultClient]; the delivery is bounded by the context the
 // [Publisher] passes, not by the client.
+//
+// A rejected URL is reported as [ErrInvalidURL] alone. Neither the URL nor the
+// parser's explanation goes into the error: the URL may carry credentials or
+// tokens, and the explanation quotes pieces of it — a password mistaken for a
+// port, say, when the @ is missing.
 func NewHTTPObserver(rawURL string, client *http.Client) (*HTTPObserver, error) {
 	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse audit URL: %w", err)
-	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("audit URL %q must be an absolute http or https URL", rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, ErrInvalidURL
 	}
 	if client == nil {
 		client = http.DefaultClient

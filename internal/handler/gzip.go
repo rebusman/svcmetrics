@@ -26,8 +26,8 @@ var (
 )
 
 // gzipReader is a pooled decompressor together with the buffered reader it
-// reads through. gzip.Reader.Reset wraps a source that is not an
-// io.ByteReader — and a request body is not — in a fresh bufio.Reader, so
+// reads through. [gzip.Reader.Reset] wraps a source that is not an
+// [io.ByteReader] — and a request body is not — in a fresh [bufio.Reader], so
 // keeping that buffer in the pool as well is what makes the reuse free.
 type gzipReader struct {
 	*gzip.Reader

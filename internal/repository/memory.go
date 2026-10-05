@@ -58,7 +58,7 @@ func (s *MemStorage) UpdateCounter(_ context.Context, name string, value int64) 
 
 // UpdateBatch applies the batch under a single lock, so a reader never observes
 // half of it. The batch is validated before the lock is taken: a malformed one
-// leaves the storage untouched and returns models.ErrInvalidMetric.
+// leaves the storage untouched and returns [models.ErrInvalidMetric].
 func (s *MemStorage) UpdateBatch(_ context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
@@ -83,7 +83,7 @@ func (s *MemStorage) UpdateBatch(_ context.Context, metrics []models.Metrics) er
 	return nil
 }
 
-// GetGauge returns the stored gauge, or models.ErrNotFound if it is absent.
+// GetGauge returns the stored gauge, or [models.ErrNotFound] if it is absent.
 func (s *MemStorage) GetGauge(_ context.Context, name string) (float64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -94,7 +94,7 @@ func (s *MemStorage) GetGauge(_ context.Context, name string) (float64, error) {
 	return val, nil
 }
 
-// GetCounter returns the stored counter, or models.ErrNotFound if it is absent.
+// GetCounter returns the stored counter, or [models.ErrNotFound] if it is absent.
 func (s *MemStorage) GetCounter(_ context.Context, name string) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -208,7 +208,7 @@ func writeAndClose(f *os.File, data []byte) error {
 //
 // Entries with an unknown type or without a value are skipped: the valid rest
 // of the snapshot is still loaded, and the skips are reported as an error
-// wrapping models.ErrInvalidMetric, so the caller can tell a partial restore
+// wrapping [models.ErrInvalidMetric], so the caller can tell a partial restore
 // from a complete one.
 func (s *MemStorage) Load(ctx context.Context, path string) error {
 	data, err := retry.DoValue(ctx, s.retry, func(context.Context) ([]byte, error) {
