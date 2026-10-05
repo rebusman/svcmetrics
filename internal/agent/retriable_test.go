@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -86,9 +87,30 @@ func TestIsRetriableSendError(t *testing.T) {
 	}
 }
 
+// reportOnce runs a single report through the pipeline Run assembles: the
+// reporter cuts the collected state into batches and a pool of the configured
+// size sends them. It returns once every batch has been dealt with, so a test
+// can look at what reached the server without racing the workers.
+func reportOnce(ctx context.Context, a *Agent) {
+	batches := make(chan []models.Metrics)
+
+	var workers sync.WaitGroup
+	for range a.rateLimit {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			a.work(ctx, batches)
+		}()
+	}
+
+	a.enqueue(ctx, batches)
+	close(batches)
+	workers.Wait()
+}
+
 // newTestAgent returns an agent talking to ts and retrying without waiting.
 func newTestAgent(ts *httptest.Server) *Agent {
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 	a.retry.Intervals = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 	return a
@@ -113,7 +135,7 @@ func TestReportRetriesUntilServerRecovers(t *testing.T) {
 	a := newTestAgent(ts)
 	seed(a)
 
-	a.reportWithRetry(context.Background())
+	reportOnce(context.Background(), a)
 
 	if got := requests.Load(); got != 3 {
 		t.Fatalf("requests = %d, want 3 — the report must be repeated", got)
@@ -142,7 +164,7 @@ func TestReportDoesNotRetryRejectedBatch(t *testing.T) {
 	a := newTestAgent(ts)
 	seed(a)
 
-	a.reportWithRetry(context.Background())
+	reportOnce(context.Background(), a)
 
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("requests = %d, want 1 — a rejected batch must not be repeated", got)
@@ -171,7 +193,7 @@ func TestReportGivesUpAfterTheSchedule(t *testing.T) {
 	a := newTestAgent(ts)
 	seed(a)
 
-	a.reportWithRetry(context.Background())
+	reportOnce(context.Background(), a)
 
 	if want := int64(len(a.retry.Intervals) + 1); requests.Load() != want {
 		t.Fatalf("requests = %d, want %d", requests.Load(), want)
@@ -203,7 +225,7 @@ func TestReportStopsWhenContextIsCancelled(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 	a.retry.Intervals = []time.Duration{time.Hour, time.Hour, time.Hour}
 	seed(a)
@@ -213,10 +235,10 @@ func TestReportStopsWhenContextIsCancelled(t *testing.T) {
 	defer cancelReport()
 
 	start := time.Now()
-	a.reportWithRetry(ctx)
+	reportOnce(ctx, a)
 
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("reportWithRetry() waited %v after cancellation", elapsed)
+		t.Fatalf("the report waited %v after cancellation", elapsed)
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("requests = %d, want 1", got)
@@ -238,7 +260,7 @@ func TestSendBatchReportsStatusCode(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := New(ts.URL, time.Second, time.Second, 0)
+	a := New(ts.URL, time.Second, time.Second, 0, "", 0)
 	a.client = ts.Client()
 
 	err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1.5)})

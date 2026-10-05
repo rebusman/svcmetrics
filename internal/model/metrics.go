@@ -2,7 +2,10 @@
 // agent and the storages.
 package models
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 // Metric types supported by the service.
 const (
@@ -26,8 +29,22 @@ const (
 	RandomValue = "RandomValue"
 )
 
-// GaugeMetricNames is the single source of truth for the collected gauge metrics.
-var GaugeMetricNames = []string{
+// Metric names read from the operating system rather than from the Go runtime.
+const (
+	TotalMemory = "TotalMemory"
+	FreeMemory  = "FreeMemory"
+)
+
+// CPUUtilization returns the gauge name carrying the load of the n-th CPU,
+// numbered from one. How many of these names exist is not known until run
+// time, because it follows the number of CPUs the host reports.
+func CPUUtilization(n int) string {
+	return "CPUutilization" + strconv.Itoa(n)
+}
+
+// RuntimeGaugeMetricNames is the single source of truth for the gauge metrics
+// read from the Go runtime.
+var RuntimeGaugeMetricNames = []string{
 	"Alloc",
 	"BuckHashSys",
 	"Frees",
@@ -56,6 +73,15 @@ var GaugeMetricNames = []string{
 	"Sys",
 	"TotalAlloc",
 	RandomValue,
+}
+
+// SystemGaugeMetricNames is the single source of truth for the gauge metrics
+// read from the host that are known ahead of time. The CPUutilization gauges
+// are deliberately absent: their names are built by [CPUUtilization] once the
+// number of CPUs is known.
+var SystemGaugeMetricNames = []string{
+	TotalMemory,
+	FreeMemory,
 }
 
 // CounterMetricNames is the single source of truth for the collected counter metrics.

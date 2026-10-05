@@ -1,5 +1,14 @@
-// Package agent collects runtime metrics and reports them to the metrics
-// server in gzip-compressed batches.
+// Package agent collects metrics and reports them to the metrics server in
+// gzip-compressed batches. An agent configured with a key signs the compressed
+// request body and puts the digest in [hashing.Header]; an agent without one
+// sends no signature at all.
+//
+// Collecting and reporting run apart: two collectors — one reading the Go
+// runtime, one reading the host through gopsutil — write into the shared
+// state, while a reporter cuts that state into batches and hands them to a
+// pool of workers that do the sending. The pool is the rate limit: however
+// much there is to report, no more than one request per worker is ever in
+// flight.
 package agent
 
 import (
@@ -13,10 +22,12 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/retry"
 )
@@ -31,6 +42,11 @@ const (
 	// DefaultBatchSize is how many metrics go into one POST /updates/ request
 	// unless the caller configures something else.
 	DefaultBatchSize = 32
+
+	// DefaultRateLimit is how many reports may be in flight at once unless the
+	// caller configures something else. One keeps an agent that has fallen
+	// behind from turning into a burst of requests the server has to absorb.
+	DefaultRateLimit = 1
 )
 
 // gzipWriterPool recycles the compressors used for the request bodies.
@@ -46,9 +62,10 @@ type metricState struct {
 	counters map[string]int64
 }
 
-// Agent polls the runtime for metrics and reports them to the server. A report
-// that failed for a passing reason is repeated before the metrics it carries
-// are handed back to the accumulator. It is safe for concurrent use.
+// Agent polls the runtime and the host for metrics and reports them to the
+// server. A report that failed for a passing reason is repeated before the
+// metrics it carries are handed back to the accumulator. It is safe for
+// concurrent use.
 type Agent struct {
 	endpoint string
 	client   *http.Client
@@ -56,20 +73,33 @@ type Agent struct {
 	pollInterval   time.Duration
 	reportInterval time.Duration
 	batchSize      int
+	rateLimit      int
+	key            string
 
-	// retry governs the reports only: collecting metrics from the runtime
-	// cannot fail in a way a repetition would fix.
+	// retry governs the reports only: reading the runtime cannot fail in a way
+	// a repetition would fix, and a host statistic that could not be read is
+	// simply left to the next poll.
 	retry retry.Config
+
+	// onError, when non-nil, sees the failures the agent survives on its own:
+	// a host statistic it could not read and a report it gave up on.
+	onError func(error)
 
 	mu               sync.RWMutex
 	metrics          metricState
 	lastSentCounters map[string]int64
+
+	// cpuCount is how many CPUutilization gauges the previous host reading left
+	// in the state, so that a reading finding fewer CPUs can drop the ones that
+	// went away. It is guarded by mu.
+	cpuCount int
 }
 
 // New returns an agent reporting to endpoint. batchSize caps how many metrics
-// travel in one request; a non-positive value of any setting falls back to its
-// default.
-func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize int) *Agent {
+// travel in one request and rateLimit how many requests are in flight at once;
+// a non-positive value of any setting falls back to its default. A non-empty
+// key enables HMAC-SHA256 request signing.
+func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize int, key string, rateLimit int) *Agent {
 	if endpoint == "" {
 		endpoint = defaultServerAddress
 	}
@@ -82,6 +112,9 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 	if batchSize <= 0 {
 		batchSize = DefaultBatchSize
 	}
+	if rateLimit <= 0 {
+		rateLimit = DefaultRateLimit
+	}
 
 	return &Agent{
 		endpoint:       strings.TrimRight(endpoint, "/"),
@@ -89,9 +122,11 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
 		batchSize:      batchSize,
+		rateLimit:      rateLimit,
+		key:            key,
 		retry:          retry.Config{Retriable: isRetriableSendError},
 		metrics: metricState{
-			gauges:   make(map[string]float64, len(models.GaugeMetricNames)),
+			gauges:   make(map[string]float64, gaugeCapacity()),
 			counters: make(map[string]int64, len(models.CounterMetricNames)),
 		},
 		lastSentCounters: make(map[string]int64, len(models.CounterMetricNames)),
@@ -104,48 +139,158 @@ func (a *Agent) SetOnRetry(fn retry.OnRetry) {
 	a.retry.OnRetry = fn
 }
 
-// Run collects and reports metrics until the context is cancelled.
-func (a *Agent) Run(ctx context.Context) {
-	pollTicker := time.NewTicker(a.pollInterval)
-	defer pollTicker.Stop()
+// SetOnError installs fn as the observer of the failures the agent survives on
+// its own: a host statistic it could not read and a report it gave up on after
+// every repetition failed. Without it those failures pass silently.
+func (a *Agent) SetOnError(fn func(error)) {
+	a.onError = fn
+}
 
-	reportTicker := time.NewTicker(a.reportInterval)
-	defer reportTicker.Stop()
+// reportError hands err to the observer, if there is one.
+func (a *Agent) reportError(err error) {
+	if a.onError != nil {
+		a.onError(err)
+	}
+}
+
+// Run collects and reports metrics until the context is cancelled, and returns
+// once every goroutine it started has stopped.
+//
+// The collectors, the reporter and the workers are separate goroutines joined
+// by a single channel of batches. Run drives the reporter itself and blocks,
+// as it did when all of this happened in one loop.
+//
+// The workers and the collectors stop on different signals — the workers when
+// the channel of batches closes, the collectors when the context is cancelled —
+// and neither has to outlive the other. A single [sync.WaitGroup] holds them
+// all, so the two kinds are joined at once rather than one pool after the
+// other, and nothing a worker does delays a collector's completion.
+func (a *Agent) Run(ctx context.Context) {
+	batches := make(chan []models.Metrics)
+
+	var running sync.WaitGroup
+	for range a.rateLimit {
+		running.Go(func() {
+			a.work(ctx, batches)
+		})
+	}
+	running.Go(func() {
+		a.poll(ctx, a.collectRuntime)
+	})
+	running.Go(func() {
+		a.poll(ctx, a.CollectSystemMetrics)
+	})
+
+	a.report(ctx, batches)
+
+	// Only the reporter sends, so it is the one that may close the channel;
+	// the workers then finish what they are already holding and stop.
+	close(batches)
+	running.Wait()
+}
+
+// collectRuntime adapts [Agent.CollectRuntimeMetrics] to the signature poll
+// expects, and always returns nil.
+//
+// The collector itself keeps the signature it deserves: reading the runtime
+// statistics cannot fail, and an exported method returning an error that is
+// always nil would be worse than this adapter.
+func (a *Agent) collectRuntime(context.Context) error {
+	a.CollectRuntimeMetrics()
+	return nil
+}
+
+// poll runs collect on every tick of the poll interval until the context is
+// cancelled, handing the failures to the observer. A failed collection is not
+// repeated: the next tick is another attempt, and it comes sooner than a
+// repetition would.
+func (a *Agent) poll(ctx context.Context, collect func(context.Context) error) {
+	ticker := time.NewTicker(a.pollInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-pollTicker.C:
-			a.CollectRuntimeMetrics()
-		case <-reportTicker.C:
-			a.reportWithRetry(ctx)
+		case <-ticker.C:
+			if err := collect(ctx); err != nil {
+				a.reportError(err)
+			}
 		}
 	}
 }
 
-// reportWithRetry sends the collected metrics, repeating a report that failed
-// for a retriable reason on the schedule of [retry.DefaultIntervals]. It stops
-// early if the context is cancelled or if the server rejected the batch on its
-// merits, which no repetition will change.
-//
-// The snapshot is taken once and only the batches the server has not accepted
-// are retried: resending an accepted batch would count its counter deltas
-// twice. Deltas that never made it are handed back for the next report.
-func (a *Agent) reportWithRetry(ctx context.Context) {
-	pending := a.collectBatch()
-	if len(pending) == 0 {
-		return
-	}
+// report cuts the collected metrics into batches on every tick of the report
+// interval and hands them to the workers until the context is cancelled.
+func (a *Agent) report(ctx context.Context, batches chan<- []models.Metrics) {
+	ticker := time.NewTicker(a.reportInterval)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !a.enqueue(ctx, batches) {
+				return
+			}
+		}
+	}
+}
+
+// enqueue splits the metrics collected so far into batches of at most
+// batchSize and offers them to the workers, waiting while they are all busy —
+// that back pressure is what holds the number of requests in flight down to
+// the rate limit. It returns false once the context is cancelled, handing the
+// deltas of the batches nobody took back to the accumulator.
+func (a *Agent) enqueue(ctx context.Context, batches chan<- []models.Metrics) bool {
+	pending := a.collectBatch()
+
+	for start := 0; start < len(pending); start += a.batchSize {
+		end := min(start+a.batchSize, len(pending))
+
+		select {
+		case <-ctx.Done():
+			a.returnCounters(pending[start:])
+			return false
+		case batches <- pending[start:end]:
+		}
+	}
+	return true
+}
+
+// work sends the batches the reporter produces, one at a time, until the
+// channel is closed. Each worker is one permitted request in flight, which is
+// what makes the size of the pool the rate limit.
+func (a *Agent) work(ctx context.Context, batches <-chan []models.Metrics) {
+	for batch := range batches {
+		a.sendWithRetry(ctx, batch)
+	}
+}
+
+// sendWithRetry sends one batch, repeating a report that failed for a
+// retriable reason on the schedule of [retry.DefaultIntervals]. It stops early
+// if the context is cancelled or if the server rejected the batch on its
+// merits, which no repetition will change; the deltas of a batch that never
+// arrived are handed back for the next report.
+//
+// Retrying inside the worker is what keeps a struggling server from costing
+// more than one slot in the pool: the batch waits on the worker holding it
+// instead of on a request of its own.
+func (a *Agent) sendWithRetry(ctx context.Context, batch []models.Metrics) {
 	err := retry.Do(ctx, a.retry, func(ctx context.Context) error {
-		var err error
-		pending, err = a.sendBatches(ctx, pending)
-		return err
+		return a.sendBatch(ctx, batch)
 	})
 	if err != nil {
-		a.returnCounters(pending)
+		a.returnCounters(batch)
+		a.reportError(err)
 	}
+}
+
+// gaugeCapacity estimates how many gauges an agent ends up holding, so that
+// the map behind them is allocated once.
+func gaugeCapacity() int {
+	return len(models.RuntimeGaugeMetricNames) + len(models.SystemGaugeMetricNames) + runtime.NumCPU()
 }
 
 // CollectRuntimeMetrics reads the runtime memory statistics into the agent's
@@ -192,8 +337,10 @@ func (a *Agent) CollectRuntimeMetrics() {
 	a.metrics.counters[models.PollCount]++
 }
 
-// SendMetrics reports everything collected so far as one or more batches. It
-// makes a single attempt: the retrying report is what Run drives.
+// SendMetrics reports everything collected so far as one or more batches, sent
+// one after another. It makes a single attempt and does not go through the
+// worker pool — the retrying, rate-limited report is what Run drives — so it
+// stays within the limit by never having more than one request in flight.
 func (a *Agent) SendMetrics(ctx context.Context) error {
 	pending := a.collectBatch()
 	if len(pending) == 0 {
@@ -210,17 +357,17 @@ func (a *Agent) SendMetrics(ctx context.Context) error {
 
 // collectBatch turns the current state into a batch, marking the counters as
 // sent. Counters with a zero delta are left out: they carry no information, and
-// dropping them keeps an idle agent from sending anything at all. The batch
-// order is stable from one report to the next.
+// dropping them keeps an idle agent from sending anything at all.
+//
+// The gauges are ordered by name rather than by a fixed list, because the
+// CPUutilization gauges are not known until the host has been read; sorting
+// still keeps the batch order stable from one report to the next.
 func (a *Agent) collectBatch() []models.Metrics {
 	gauges, deltas := a.snapshotForReport()
 
 	batch := make([]models.Metrics, 0, len(gauges)+len(deltas))
-	for _, name := range models.GaugeMetricNames {
-		value, ok := gauges[name]
-		if !ok {
-			continue
-		}
+	for _, name := range slices.Sorted(maps.Keys(gauges)) {
+		value := gauges[name]
 		batch = append(batch, models.Metrics{ID: name, MType: models.Gauge, Value: &value})
 	}
 	for _, name := range models.CounterMetricNames {
@@ -280,11 +427,15 @@ func (a *Agent) snapshotForReport() (map[string]float64, map[string]int64) {
 	return gauges, deltas
 }
 
-// sendBatch posts one gzip-compressed batch to /updates/. An empty batch is
-// never sent. The compressor comes from a pool and is pointed back at
-// io.Discard before it is returned, so a pooled writer never pins the payload
-// it compressed; the response body is drained so the transport can reuse the
-// connection for the next batch.
+// sendBatch posts one gzip-compressed batch to /updates/. When the agent has a
+// key, the complete compressed body is signed and the digest goes into
+// [hashing.Header] — the server verifies the request before it decompresses
+// it, so the JSON behind the gzip is the wrong thing to sign. An empty batch is
+// never sent. The
+// compressor comes from a pool and is pointed back at io.Discard before it is
+// returned, so a pooled writer never pins the payload it compressed; the
+// response body is drained so the transport can reuse the connection for the
+// next batch.
 func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
@@ -318,6 +469,9 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+	if a.key != "" {
+		req.Header.Set(hashing.Header, hashing.Sum(body, a.key))
+	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {

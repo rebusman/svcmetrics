@@ -15,6 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.uber.org/mock/gomock"
 
+	"github.com/rebusman/svcmetrics/internal/hashing"
 	"github.com/rebusman/svcmetrics/internal/mocks"
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
@@ -24,8 +25,18 @@ import (
 // e2e build tag cover the same paths against real PostgreSQL.
 
 // newMockedServer builds the production router on top of a mock storage and a
-// mock pinger.
+// mock pinger, without request signing.
 func newMockedServer(t *testing.T) (*mocks.MockStorage, *mocks.MockPinger, http.Handler) {
+	t.Helper()
+
+	storage, pinger, r, _ := newMockedServerWithKey(t, "")
+	return storage, pinger, r
+}
+
+// newMockedServerWithKey builds the same router with signing enabled and hands
+// back the buffer the request log is written to, so tests can assert on what
+// the server recorded about a request.
+func newMockedServerWithKey(t *testing.T, key string) (*mocks.MockStorage, *mocks.MockPinger, http.Handler, *bytes.Buffer) {
 	t.Helper()
 
 	ctrl := gomock.NewController(t)
@@ -33,9 +44,10 @@ func newMockedServer(t *testing.T) (*mocks.MockStorage, *mocks.MockPinger, http.
 	pinger := mocks.NewMockPinger(ctrl)
 
 	log := logrus.New()
-	log.SetOutput(io.Discard)
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
 
-	return storage, pinger, newRouter(log, storage, pinger)
+	return storage, pinger, newRouter(log, storage, pinger, key), &logged
 }
 
 // TestRouterSendsBatchToStorage verifies that both spellings of the batch path
@@ -189,5 +201,93 @@ func TestRouterPingUsesPinger(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+// TestRouterVerifiesSignedBatch checks the signature middleware in its place in
+// the chain: the digest is taken over the compressed body the client sent, and
+// the response is signed over the compressed body the client receives.
+func TestRouterVerifiesSignedBatch(t *testing.T) {
+	const key = "secret"
+
+	storage, _, r, _ := newMockedServerWithKey(t, key)
+	storage.EXPECT().UpdateBatch(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	payload := `[{"id":"Alloc","type":"gauge","value":1.5}]`
+	if _, err := io.WriteString(zw, payload); err != nil {
+		t.Fatalf("gzip write error = %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close error = %v", err)
+	}
+	body := compressed.Bytes()
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set(hashing.Header, hashing.Sum(body, key))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %q)", rec.Code, rec.Body.String())
+	}
+	if !hashing.Equal(rec.Header().Get(hashing.Header), rec.Body.Bytes(), key) {
+		t.Error("response signature does not match the transmitted body")
+	}
+}
+
+// TestRouterServesUnsignedReads checks that a key does not lock out the clients
+// that never sign: the HTML page, /value and /ping are read with plain requests
+// and have to keep answering.
+func TestRouterServesUnsignedReads(t *testing.T) {
+	const key = "secret"
+
+	storage, pinger, r, _ := newMockedServerWithKey(t, key)
+	storage.EXPECT().GetGauge(gomock.Any(), "Alloc").Return(12.5, nil).Times(1)
+	storage.EXPECT().GetAllGauges(gomock.Any()).Return(map[string]float64{"Alloc": 12.5}, nil).Times(1)
+	storage.EXPECT().GetAllCounters(gomock.Any()).Return(map[string]int64{}, nil).Times(1)
+	pinger.EXPECT().PingContext(gomock.Any()).Return(nil).Times(1)
+
+	for _, path := range []string{"/value/gauge/Alloc", "/", "/ping"} {
+		t.Run(path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body = %q)", rec.Code, rec.Body.String())
+			}
+			if !hashing.Equal(rec.Header().Get(hashing.Header), rec.Body.Bytes(), key) {
+				t.Error("response signature does not match the transmitted body")
+			}
+		})
+	}
+}
+
+// TestRouterRejectsAndLogsBadSignature checks that a forged request never
+// reaches the storage and still shows up in the request log, which is why the
+// signature middleware sits inside the logging one.
+func TestRouterRejectsAndLogsBadSignature(t *testing.T) {
+	const key = "secret"
+
+	_, _, r, logged := newMockedServerWithKey(t, key)
+
+	body := `[{"id":"Alloc","type":"gauge","value":1.5}]`
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(hashing.Header, hashing.Sum([]byte(body), "another key"))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body = %q)", rec.Code, rec.Body.String())
+	}
+	if entry := logged.String(); !strings.Contains(entry, "/updates/") || !strings.Contains(entry, "400") {
+		t.Errorf("request log = %q, want the rejected request in it", entry)
 	}
 }
