@@ -97,5 +97,30 @@ go test -run '^$' -bench BenchmarkAgentReport -benchmem -benchtime 2000x     -me
 ### Сравнение профилей
 
 ```
-go tool pprof -top -diff_base=profiles/base.pprof profiles/result.pprof
+$ go tool pprof -top -nodecount=12 -diff_base= profiles/base.pprof profiles/result.pprof
+Showing nodes accounting for -1819.46MB, 94.67% of 1921.82MB total
+      flat  flat%   sum%        cum   cum%
+-1300.43MB 67.67% 67.67% -1581.14MB 82.27%  compress/flate.NewWriter (inline)
+ -272.93MB 14.20% 81.87%  -272.93MB 14.20%  compress/flate.(*compressor).initDeflate (inline)
+ -123.56MB  6.43% 88.30%  -123.56MB  6.43%  compress/flate.(*dictDecoder).init (inline)
+  -33.78MB  1.76% 90.06%   -33.78MB  1.76%  sync.(*Pool).pinSlow
+  -29.08MB  1.51% 91.57%  -152.64MB  7.94%  compress/flate.NewReader
+  -24.62MB  1.28% 92.85%   -24.62MB  1.28%  net/http.init.func15
+  -15.81MB  0.82% 93.67%   -15.81MB  0.82%  bufio.NewReaderSize (inline)
+  -13.55MB   0.7% 94.38%   -13.55MB   0.7%  compress/flate.(*huffmanEncoder).generate
+   -2.93MB  0.15% 94.53%    -9.91MB  0.52%  encoding/json.Marshal
+   -2.69MB  0.14% 94.67%  -173.10MB  9.01%  compress/gzip.NewReader (inline)
+   -0.05MB 0.0024% 94.67% -1552.44MB 80.78%  github.com/rebusman/svcmetrics/internal/handler.GzipResponseMiddleware.func1
+   -0.03MB 0.0016% 94.67%  -147.64MB  7.68%  github.com/rebusman/svcmetrics/internal/agent.(*Agent).sendBatch
 ```
+
+
+```
+$ go tool pprof -top -sample_index=alloc_objects -focus=aggregateBatch -diff_base profiles/base.pprof profiles/result.pprof
+Showing nodes accounting for -30003, 4.12% of 728034 total
+      flat  flat%   sum%        cum   cum%
+    -28003  3.85%  3.85%     -28003  3.85%  github.com/rebusman/svcmetrics/internal/repository.copyMetric (inline)
+     -4000  0.55%  4.40%      -4000  0.55%  internal/reflectlite.Swapper
+      2000  0.27%  4.12%     -30003  4.12%  github.com/rebusman/svcmetrics/internal/repository.aggregateBatch
+```
+
