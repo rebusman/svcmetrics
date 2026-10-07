@@ -11,17 +11,23 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
-// auditSpy is an Auditor that remembers the events it was given.
-type auditSpy struct {
-	events []audit.Event
+// auditCall is one call to [auditSpy.Notify].
+type auditCall struct {
+	time    time.Time
+	metrics []string
+	ip      string
 }
 
-func (a *auditSpy) Notify(_ context.Context, e audit.Event) {
-	a.events = append(a.events, e)
+// auditSpy is an Auditor that remembers the calls it was given.
+type auditSpy struct {
+	events []auditCall
+}
+
+func (a *auditSpy) Notify(_ context.Context, t time.Time, metrics []string, ip string) {
+	a.events = append(a.events, auditCall{time: t, metrics: metrics, ip: ip})
 }
 
 func newAuditedRouter(a Auditor) chi.Router {
@@ -51,7 +57,7 @@ func TestUpdateHandlersNotifyAuditor(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
 			req.RemoteAddr = "192.168.0.42:51234"
-			before := time.Now().Unix()
+			before := time.Now()
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 
@@ -62,14 +68,14 @@ func TestUpdateHandlersNotifyAuditor(t *testing.T) {
 				t.Fatalf("got %d events, want 1", len(spy.events))
 			}
 			e := spy.events[0]
-			if !reflect.DeepEqual(e.Metrics, tt.metrics) {
-				t.Errorf("metrics = %q, want %q", e.Metrics, tt.metrics)
+			if !reflect.DeepEqual(e.metrics, tt.metrics) {
+				t.Errorf("metrics = %q, want %q", e.metrics, tt.metrics)
 			}
-			if e.IPAddress != "192.168.0.42" {
-				t.Errorf("ip_address = %q, want 192.168.0.42", e.IPAddress)
+			if e.ip != "192.168.0.42" {
+				t.Errorf("ip = %q, want 192.168.0.42", e.ip)
 			}
-			if e.TS < before || e.TS > time.Now().Unix() {
-				t.Errorf("ts = %d, not the time of the request", e.TS)
+			if e.time.Before(before) || e.time.After(time.Now()) {
+				t.Errorf("time = %v, not the time of the request", e.time)
 			}
 		})
 	}

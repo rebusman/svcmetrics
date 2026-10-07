@@ -35,8 +35,8 @@ func (o *FileObserver) Name() string { return "file " + o.file.Name() }
 // single call, so a concurrent writer to the same file cannot split it.
 //
 // The context is ignored: a write to a file cannot be cancelled. The file is
-// expected to be local; one on a hung network file system blocks the
-// [Publisher] and with it every other observer.
+// expected to be local; one on a hung network file system blocks the delivery
+// to this observer until its queue in the [Publisher] fills up.
 func (o *FileObserver) Update(_ context.Context, e Event) error {
 	line, err := json.Marshal(e)
 	if err != nil {

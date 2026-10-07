@@ -73,7 +73,7 @@ func TestPublisherNotifiesEveryObserverInOrder(t *testing.T) {
 		NewEvent(time.Unix(2, 0), []string{"PollCount"}, "10.0.0.2"),
 	}
 	for _, e := range events {
-		p.Notify(context.Background(), e)
+		p.Publish(context.Background(), e)
 	}
 	closePublisher(t, p)
 
@@ -99,7 +99,7 @@ func TestPublisherReportsObserverFailure(t *testing.T) {
 	p.Register(failing)
 	p.Register(healthy)
 
-	p.Notify(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
+	p.Publish(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
 	closePublisher(t, p)
 
 	if want := []string{"recorder: boom"}; !reflect.DeepEqual(reported, want) {
@@ -116,7 +116,7 @@ func TestPublisherIgnoresEventsAfterClose(t *testing.T) {
 	p.Register(o)
 	closePublisher(t, p)
 
-	p.Notify(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
+	p.Publish(context.Background(), NewEvent(time.Now(), []string{"Alloc"}, "10.0.0.1"))
 	closePublisher(t, p)
 
 	if got := o.received(); len(got) != 0 {
@@ -232,6 +232,22 @@ func TestHTTPObserverFailsOnErrorStatus(t *testing.T) {
 	}
 }
 
+func TestNewHTTPObserverDefaultClient(t *testing.T) {
+	o, err := NewHTTPObserver("http://example.com/audit", nil)
+	if err != nil {
+		t.Fatalf("NewHTTPObserver: %v", err)
+	}
+	if o.client == http.DefaultClient {
+		t.Fatal("nil client resolved to http.DefaultClient")
+	}
+	if o.client.Timeout != DefaultDeliveryTimeout {
+		t.Errorf("client timeout = %v, want %v", o.client.Timeout, DefaultDeliveryTimeout)
+	}
+	if o.client.Transport == nil || o.client.Transport == http.DefaultTransport {
+		t.Error("client uses http.DefaultTransport")
+	}
+}
+
 func TestNewHTTPObserverRejectsBadURL(t *testing.T) {
 	for _, raw := range []string{"", "localhost:8080/audit", "ftp://example.com", "http://", "://bad"} {
 		if _, err := NewHTTPObserver(raw, nil); err == nil {
@@ -314,7 +330,7 @@ func TestPublisherCallsOnErrorWithoutLock(t *testing.T) {
 	var p *Publisher
 	dropped := make(chan struct{}, 1)
 	p = NewPublisher(func(observer string, err error) {
-		if observer == "" && errors.Is(err, ErrQueueFull) {
+		if observer == "gated" && errors.Is(err, ErrQueueFull) {
 			p.Register(gatedObserver{gate: gate})
 			select {
 			case dropped <- struct{}{}:
@@ -324,20 +340,20 @@ func TestPublisherCallsOnErrorWithoutLock(t *testing.T) {
 	})
 	p.Register(gatedObserver{gate: gate})
 
-	// One event is held by the blocked delivery, queueSize fill the queue and
-	// the last one has nowhere to go.
+	// One event is held by the blocked delivery, DefaultQueueSize fill the
+	// queue and the last one has nowhere to go.
 	notified := make(chan struct{})
 	go func() {
 		defer close(notified)
-		for range queueSize + 2 {
-			p.Notify(context.Background(), Event{})
+		for range DefaultQueueSize + 2 {
+			p.Publish(context.Background(), Event{})
 		}
 	}()
 
 	select {
 	case <-notified:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Notify deadlocked in the OnError callback")
+		t.Fatal("Publish deadlocked in the OnError callback")
 	}
 	select {
 	case <-dropped:
@@ -353,6 +369,77 @@ func TestPublisherCallsOnErrorWithoutLock(t *testing.T) {
 	}
 }
 
+// TestPublisherIsolatesSlowObserver checks that an observer blocked in its
+// delivery neither delays the others nor keeps from them an event dropped for
+// it alone.
+func TestPublisherIsolatesSlowObserver(t *testing.T) {
+	gate := make(chan struct{})
+
+	var (
+		mu      sync.Mutex
+		dropped []string
+	)
+	p := NewPublisher(func(observer string, err error) {
+		if errors.Is(err, ErrQueueFull) {
+			mu.Lock()
+			defer mu.Unlock()
+			dropped = append(dropped, observer)
+		}
+	}, WithQueueSize(1))
+	p.Register(gatedObserver{gate: gate})
+	fast := &recorder{}
+	p.Register(fast)
+
+	// The blocked observer holds the first event and queues the second; the
+	// third is dropped for it, but not for the fast one, which gets every
+	// event while the other is still stuck.
+	for i := range 3 {
+		p.Publish(context.Background(), Event{TS: int64(i + 1)})
+		waitFor(t, func() bool { return len(fast.received()) == i+1 })
+	}
+
+	close(gate)
+	closePublisher(t, p)
+
+	if want := []string{"gated"}; !reflect.DeepEqual(dropped, want) {
+		t.Errorf("dropped for %q, want %q", dropped, want)
+	}
+}
+
+// TestPublisherDeliveryTimeout checks that WithDeliveryTimeout bounds the
+// delivery to an observer that never finishes on its own.
+func TestPublisherDeliveryTimeout(t *testing.T) {
+	gate := make(chan struct{})
+	defer close(gate)
+
+	failed := make(chan error, 1)
+	p := NewPublisher(func(_ string, err error) { failed <- err }, WithDeliveryTimeout(10*time.Millisecond))
+	p.Register(gatedObserver{gate: gate})
+	p.Publish(context.Background(), Event{})
+
+	select {
+	case err := <-failed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delivery was not cut off")
+	}
+	closePublisher(t, p)
+}
+
+// waitFor polls cond until it holds or a few seconds pass.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestPublisherRegisterAffectsLaterEventsOnly checks the boundary Register
 // promises: an event published before an observer was registered never
 // reaches it, even when it is still waiting in the queue at that moment.
@@ -363,12 +450,12 @@ func TestPublisherRegisterAffectsLaterEventsOnly(t *testing.T) {
 
 	// The first event holds up the delivery, so the second is still queued
 	// when the recorder joins.
-	p.Notify(context.Background(), Event{TS: 1})
-	p.Notify(context.Background(), Event{TS: 2})
+	p.Publish(context.Background(), Event{TS: 1})
+	p.Publish(context.Background(), Event{TS: 2})
 
 	late := &recorder{}
 	p.Register(late)
-	p.Notify(context.Background(), Event{TS: 3})
+	p.Publish(context.Background(), Event{TS: 3})
 
 	close(gate)
 	closePublisher(t, p)

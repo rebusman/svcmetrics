@@ -363,21 +363,36 @@ func (a *Agent) SendMetrics(ctx context.Context) error {
 // CPUutilization gauges are not known until the host has been read; sorting
 // still keeps the batch order stable from one report to the next.
 //
-// The batch is built under the lock directly from the state, with the values
-// its metrics point at held in one slice per kind: no copy of the state and no
-// allocation per metric.
+// The batch is built under the lock by snapshotBatch; only the sort runs after
+// the lock is released.
 func (a *Agent) collectBatch() []models.Metrics {
+	batch, gaugeCount := a.snapshotBatch()
+	slices.SortFunc(batch[:gaugeCount], func(x, y models.Metrics) int {
+		return strings.Compare(x.ID, y.ID)
+	})
+	return batch
+}
+
+// snapshotBatch builds the unsorted batch from the current state under the lock
+// and marks the counters as sent. The gauges come first; gaugeCount says how
+// many of them there are.
+//
+// The batch is built directly from the state, with the values its metrics point
+// at held in one slice per kind: no copy of the state and no allocation per
+// metric.
+func (a *Agent) snapshotBatch() (batch []models.Metrics, gaugeCount int) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	gauges := make([]float64, 0, len(a.metrics.gauges))
 	deltas := make([]int64, 0, len(models.CounterMetricNames))
-	batch := make([]models.Metrics, 0, cap(gauges)+cap(deltas))
+	batch = make([]models.Metrics, 0, cap(gauges)+cap(deltas))
 
 	for name, value := range a.metrics.gauges {
 		gauges = append(gauges, value)
 		batch = append(batch, models.Metrics{ID: name, MType: models.Gauge, Value: &gauges[len(gauges)-1]})
 	}
-	gaugeCount := len(batch)
+	gaugeCount = len(batch)
 
 	for _, name := range models.CounterMetricNames {
 		current := a.metrics.counters[name]
@@ -389,13 +404,7 @@ func (a *Agent) collectBatch() []models.Metrics {
 		deltas = append(deltas, delta)
 		batch = append(batch, models.Metrics{ID: name, MType: models.Counter, Delta: &deltas[len(deltas)-1]})
 	}
-
-	a.mu.Unlock()
-
-	slices.SortFunc(batch[:gaugeCount], func(x, y models.Metrics) int {
-		return strings.Compare(x.ID, y.ID)
-	})
-	return batch
+	return batch, gaugeCount
 }
 
 // sendBatches ships the metrics in chunks of at most batchSize. On failure it

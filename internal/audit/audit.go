@@ -5,9 +5,10 @@
 // registered with it. The handlers only know the publisher; adding another
 // receiver means writing another observer, not touching the handlers.
 //
-// Delivery is asynchronous. [Publisher.Notify] queues the event and returns at
+// Delivery is asynchronous. [Publisher.Publish] queues the event and returns at
 // once, so a slow or unreachable receiver never delays the request whose
-// metrics are being audited.
+// metrics are being audited. Every observer has a queue and a goroutine of its
+// own, so a slow receiver does not delay the others either.
 package audit
 
 import (
@@ -43,109 +44,163 @@ type Observer interface {
 	Update(ctx context.Context, e Event) error
 }
 
-// OnError observes an event that an observer failed to receive, or one dropped
-// because the queue was full, in which case observer is empty. A typical
-// implementation logs the failure: an audit problem must not fail the request,
-// but it must not go unnoticed either.
+// OnError observes an event that observer failed to receive, or one dropped
+// for it because its queue was full. A typical implementation logs the
+// failure: an audit problem must not fail the request, but it must not go
+// unnoticed either.
 type OnError func(observer string, err error)
 
-// ErrQueueFull reports an event dropped because the receivers fell behind.
+// ErrQueueFull reports an event dropped because the receiver fell behind.
 var ErrQueueFull = errors.New("audit queue is full")
 
 const (
-	// queueSize is the number of events that may wait for delivery before new
-	// ones are dropped.
-	queueSize = 1024
+	// DefaultQueueSize is the number of events that may wait for delivery to
+	// one observer before new ones are dropped for it.
+	DefaultQueueSize = 1024
 
-	// deliveryTimeout bounds the delivery of one event to one observer.
-	deliveryTimeout = 5 * time.Second
+	// DefaultDeliveryTimeout bounds the delivery of one event to one observer.
+	DefaultDeliveryTimeout = 5 * time.Second
 )
 
+// Option tunes the delivery policy of a [Publisher].
+type Option func(*Publisher)
+
+// WithQueueSize sets the number of events that may wait for delivery to one
+// observer; the default is [DefaultQueueSize]. A size below 1 keeps the
+// default.
+func WithQueueSize(n int) Option {
+	return func(p *Publisher) {
+		if n > 0 {
+			p.queueSize = n
+		}
+	}
+}
+
+// WithDeliveryTimeout sets the bound on the delivery of one event to one
+// observer; the default is [DefaultDeliveryTimeout]. A duration of zero or
+// less keeps the default. An [HTTPObserver] built without a client is also
+// bounded by its client's timeout of DefaultDeliveryTimeout, so a longer bound
+// needs a client passed to [NewHTTPObserver].
+func WithDeliveryTimeout(d time.Duration) Option {
+	return func(p *Publisher) {
+		if d > 0 {
+			p.deliveryTimeout = d
+		}
+	}
+}
+
 // Publisher is the subject of the audit: it fans every event out to all the
-// registered observers. Events are delivered one at a time, in the order they
-// were published, by a single background goroutine started by
-// [NewPublisher] and stopped by [Publisher.Close]. The observers are therefore
-// coupled: one that blocks past its context stalls the delivery to the others.
+// registered observers. Each observer gets the events in the order they were
+// published, from a queue and a goroutine of its own, started by
+// [Publisher.Register] and stopped by [Publisher.Close]. The observers are
+// independent: one that is slow or blocked fills its own queue and loses its
+// own events, while the others keep receiving theirs.
 type Publisher struct {
-	mu        sync.RWMutex
-	observers []Observer
-	closed    bool
+	mu      sync.RWMutex
+	workers []*worker
+	closed  bool
 
-	queue   chan delivery
-	done    chan struct{}
-	onError OnError
+	wg        sync.WaitGroup
+	done      chan struct{}
+	closeOnce sync.Once
+
+	queueSize       int
+	deliveryTimeout time.Duration
+	onError         OnError
 }
 
-// delivery is a queued event together with the observers registered when it
-// was published, which are the ones that receive it.
-//
-// The observers share the backing array of Publisher.observers rather than
-// copying it, which is safe: Register only appends, which writes past the
-// length of this slice or moves to a new array, and nothing ever changes an
-// element once it is in place.
-type delivery struct {
-	event     Event
-	observers []Observer
+// worker delivers the events queued for one observer.
+type worker struct {
+	observer Observer
+	queue    chan Event
 }
 
-// NewPublisher starts a publisher with no observers. onError may be nil.
-func NewPublisher(onError OnError) *Publisher {
+// NewPublisher creates a publisher with no observers and the delivery policy
+// set by opts. onError may be nil.
+func NewPublisher(onError OnError, opts ...Option) *Publisher {
 	if onError == nil {
 		onError = func(string, error) {}
 	}
 	p := &Publisher{
-		queue:   make(chan delivery, queueSize),
-		done:    make(chan struct{}),
-		onError: onError,
+		done:            make(chan struct{}),
+		queueSize:       DefaultQueueSize,
+		deliveryTimeout: DefaultDeliveryTimeout,
+		onError:         onError,
 	}
-	go p.run()
+	for _, opt := range opts {
+		opt(p)
+	}
 	return p
 }
 
 // Register adds an observer that receives every event published from now on:
-// an event already queued by [Publisher.Notify] keeps the observers it was
-// published to.
+// an event already queued for the other observers does not reach it. An
+// observer registered after [Publisher.Close] receives nothing.
 func (p *Publisher) Register(o Observer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.observers = append(p.observers, o)
+	if p.closed {
+		return
+	}
+	w := &worker{observer: o, queue: make(chan Event, p.queueSize)}
+	p.workers = append(p.workers, w)
+	p.wg.Add(1)
+	go p.deliver(w)
 }
 
-// Notify queues an event for every observer. It never blocks: when the queue is
-// full the event is dropped and reported through [OnError]. Events published
-// after [Publisher.Close] are ignored.
+// Notify publishes the event for metrics accepted at t from ip. It adapts the
+// publisher to the audit port of the handlers, which speaks in plain values.
+func (p *Publisher) Notify(ctx context.Context, t time.Time, metrics []string, ip string) {
+	p.Publish(ctx, NewEvent(t, metrics, ip))
+}
+
+// Publish queues an event for every observer. It never blocks: when the queue
+// of an observer is full the event is dropped for that observer alone and
+// reported through [OnError]. Events published after [Publisher.Close] are
+// ignored.
 //
-// The lock only guards the send, which must not race with Close closing the
-// queue; [OnError] runs after it is released, so a callback is free to use
+// The lock only guards the sends, which must not race with Close closing the
+// queues; [OnError] runs after it is released, so a callback is free to use
 // the publisher and a slow one does not hold up Close.
-func (p *Publisher) Notify(_ context.Context, e Event) {
+func (p *Publisher) Publish(_ context.Context, e Event) {
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
 		return
 	}
-	var dropped bool
-	select {
-	case p.queue <- delivery{event: e, observers: p.observers}:
-	default:
-		dropped = true
+	var dropped []string
+	for _, w := range p.workers {
+		select {
+		case w.queue <- e:
+		default:
+			dropped = append(dropped, w.observer.Name())
+		}
 	}
 	p.mu.RUnlock()
 
-	if dropped {
-		p.onError("", ErrQueueFull)
+	for _, name := range dropped {
+		p.onError(name, ErrQueueFull)
 	}
 }
 
 // Close stops accepting events and waits until the queued ones are delivered
-// or ctx expires.
+// to every observer or ctx expires.
 func (p *Publisher) Close(ctx context.Context) error {
 	p.mu.Lock()
 	if !p.closed {
 		p.closed = true
-		close(p.queue)
+		for _, w := range p.workers {
+			close(w.queue)
+		}
 	}
 	p.mu.Unlock()
+
+	p.closeOnce.Do(func() {
+		go func() {
+			p.wg.Wait()
+			close(p.done)
+		}()
+	})
 
 	select {
 	case <-p.done:
@@ -155,15 +210,15 @@ func (p *Publisher) Close(ctx context.Context) error {
 	}
 }
 
-func (p *Publisher) run() {
-	defer close(p.done)
-	for d := range p.queue {
-		for _, o := range d.observers {
-			ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
-			if err := o.Update(ctx, d.event); err != nil {
-				p.onError(o.Name(), err)
-			}
-			cancel()
+// deliver hands the events queued for w to its observer, one at a time, until
+// the queue is closed and empty.
+func (p *Publisher) deliver(w *worker) {
+	defer p.wg.Done()
+	for e := range w.queue {
+		ctx, cancel := context.WithTimeout(context.Background(), p.deliveryTimeout)
+		if err := w.observer.Update(ctx, e); err != nil {
+			p.onError(w.observer.Name(), err)
 		}
+		cancel()
 	}
 }

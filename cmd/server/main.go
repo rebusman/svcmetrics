@@ -254,15 +254,9 @@ func main() {
 		*auditURL = envAuditURL
 	}
 
-	publisher, closeAudit, err := newAuditPublisher(log, *auditFile, *auditURL)
+	auditor, closeAudit, err := newAuditor(log, *auditFile, *auditURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize audit: %v", err)
-	}
-	// A nil *audit.Publisher stored in the interface would not compare equal
-	// to nil, so the handlers get a plain nil when the audit is disabled.
-	var auditor handler.Auditor
-	if publisher != nil {
-		auditor = publisher
 	}
 
 	var (
@@ -273,7 +267,7 @@ func main() {
 
 	switch {
 	case *databaseDSN != "":
-		initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		initCtx, cancel := context.WithTimeout(context.Background(), dbInitTimeout)
 		pg, err := repository.NewPgStorage(initCtx, *databaseDSN)
 		cancel()
 		if err != nil {
@@ -317,15 +311,12 @@ func main() {
 
 	r := newRouter(log, hs, pinger, *key, auditor)
 
-	// The write timeout sits above requestTimeout on purpose: the router gives
-	// up on a request first and answers 504, and the connection is only dropped
-	// if even that answer does not get out in time.
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      requestTimeout + 3*time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
 	}
 
 	go func() {
@@ -353,10 +344,9 @@ func main() {
 
 	<-ctx.Done()
 
-	// Wait past the router's request deadline: a handler still running when
-	// Shutdown gives up could store metrics after the audit is closed and the
-	// storage is saved below, and both would miss them.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), requestTimeout+3*time.Second)
+	// The steps below follow the budget declared next to requestTimeout:
+	// shutdownGrace, auditDrainTimeout and storageSaveTimeout in turn.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	err = srv.Shutdown(shutdownCtx)
 	cancel()
 	if err != nil {
@@ -370,7 +360,7 @@ func main() {
 	closeAudit()
 
 	if fileStore != nil {
-		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		saveCtx, cancel := context.WithTimeout(context.Background(), storageSaveTimeout)
 		if err := fileStore.Save(saveCtx, *fileStoragePath); err != nil {
 			log.Errorf("Failed to save metrics to %s on shutdown: %v", *fileStoragePath, err)
 		}
@@ -378,16 +368,18 @@ func main() {
 	}
 }
 
-// newAuditPublisher builds the audit publisher with an observer for every
-// configured receiver: the file at path and the server at rawURL. With neither
-// configured the audit is disabled and the publisher is nil. The returned
-// function drains the queued events, within a bound, and then releases the
-// receivers; a drain that runs out of time leaves the audit file open for the
-// process exit to close, since a write still in progress could otherwise hold
-// up the shutdown for good. When the error is nil, the function is never nil,
-// even with the audit disabled. On error nothing is left open and both other
-// results are nil.
-func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publisher, func(), error) {
+// newAuditor builds the audit publisher with an observer for every configured
+// receiver: the file at path and the server at rawURL. With neither configured
+// the audit is disabled and the auditor is a plain nil interface — never a nil
+// *audit.Publisher, which would not compare equal to nil in the handlers.
+//
+// The returned function drains the queued events, within a bound, and then
+// releases the receivers; a drain that runs out of time leaves the audit file
+// open for the process exit to close, since a write still in progress could
+// otherwise hold up the shutdown for good. When the error is nil, the function
+// is never nil, even with the audit disabled. On error nothing is left open and
+// both other results are nil.
+func newAuditor(log *logrus.Logger, path, rawURL string) (handler.Auditor, func(), error) {
 	var observers []audit.Observer
 	var fileObserver *audit.FileObserver
 
@@ -418,8 +410,8 @@ func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publishe
 	}
 
 	publisher := audit.NewPublisher(func(observer string, err error) {
-		if observer == "" {
-			log.Errorf("Audit event lost: %v", err)
+		if errors.Is(err, audit.ErrQueueFull) {
+			log.Errorf("Audit event lost for %s: %v", observer, err)
 			return
 		}
 		log.Errorf("Failed to deliver audit event to %s: %v", observer, err)
@@ -429,7 +421,7 @@ func newAuditPublisher(log *logrus.Logger, path, rawURL string) (*audit.Publishe
 	}
 
 	closeAudit := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), auditDrainTimeout)
 		defer cancel()
 		if err := publisher.Close(ctx); err != nil {
 			// Delivery is still running, possibly stuck in a write to the

@@ -5,17 +5,16 @@ import (
 	"net"
 	"net/http"
 	"time"
-
-	"github.com/rebusman/svcmetrics/internal/audit"
 )
 
-// Auditor receives an event for every request whose metrics were stored. It is
-// satisfied by [audit.Publisher]; a nil Auditor disables the audit.
+// Auditor is told about every request whose metrics were stored; a nil Auditor
+// disables the audit. The port is declared here, in terms of plain values, so
+// the handlers depend on no particular audit implementation.
 type Auditor interface {
-	// Notify hands over the event for a request whose metrics were stored. It
-	// must not block the request: delivery problems are the auditor's to
-	// handle and never fail the request.
-	Notify(ctx context.Context, e audit.Event)
+	// Notify reports the names of the metrics stored at t for a request that
+	// came from ip. It must not block the request: delivery problems are the
+	// auditor's to handle and never fail the request.
+	Notify(ctx context.Context, t time.Time, metrics []string, ip string)
 }
 
 // notifyAudit reports the metrics accepted by r to a, if the audit is enabled.
@@ -23,7 +22,7 @@ func notifyAudit(a Auditor, r *http.Request, metrics []string) {
 	if a == nil || len(metrics) == 0 {
 		return
 	}
-	a.Notify(r.Context(), audit.NewEvent(time.Now(), metrics, clientIP(r)))
+	a.Notify(r.Context(), time.Now(), metrics, clientIP(r))
 }
 
 // clientIP returns the host part of the remote address of r, or the address as

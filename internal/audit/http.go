@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // HTTPObserver sends every event to a remote server as a JSON POST request.
@@ -27,8 +29,8 @@ var ErrInvalidURL = errors.New("audit URL must be an absolute http or https URL"
 
 // NewHTTPObserver checks that rawURL is an absolute http or https URL, so that
 // a typo fails at startup rather than with the first request. A nil client
-// means [http.DefaultClient]; the delivery is bounded by the context the
-// [Publisher] passes, not by the client.
+// means a client of the observer's own, built by [newHTTPClient]; the delivery
+// is bounded by the context the [Publisher] passes in any case.
 //
 // A rejected URL is reported as [ErrInvalidURL] alone. Neither the URL nor the
 // parser's explanation goes into the error: the URL may carry credentials or
@@ -40,10 +42,32 @@ func NewHTTPObserver(rawURL string, client *http.Client) (*HTTPObserver, error) 
 		return nil, ErrInvalidURL
 	}
 	if client == nil {
-		client = http.DefaultClient
+		client = newHTTPClient()
 	}
 	safeURL := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
 	return &HTTPObserver{url: rawURL, client: client, safeURL: safeURL}, nil
+}
+
+// newHTTPClient builds the client an observer uses when given none. It has a
+// transport of its own rather than [http.DefaultTransport], so the delivery is
+// not affected by whatever else in the process changes or exhausts the shared
+// one, and a timeout of [DefaultDeliveryTimeout] on top of the context.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: DefaultDeliveryTimeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
+	}
 }
 
 // Name returns the scheme and host events are sent to. The rest of the URL is

@@ -1,10 +1,6 @@
 package agent
 
-import (
-	"testing"
-
-	models "github.com/rebusman/svcmetrics/internal/model"
-)
+import "testing"
 
 func BenchmarkCollectRuntimeMetrics(b *testing.B) {
 	a := New("", 0, 0, 0, "", 0)
@@ -21,9 +17,12 @@ func BenchmarkCollectBatch(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		a.mu.Lock()
-		a.metrics.counters[models.PollCount]++
-		a.mu.Unlock()
+		// A poll between reports gives PollCount a non-zero delta, so every
+		// batch carries a counter as well as the gauges. The poll itself is
+		// measured by BenchmarkCollectRuntimeMetrics, not here.
+		b.StopTimer()
+		a.CollectRuntimeMetrics()
+		b.StartTimer()
 
 		if batch := a.collectBatch(); len(batch) == 0 {
 			b.Fatal("empty batch")
