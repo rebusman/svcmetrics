@@ -1,9 +1,38 @@
-// Command server serves the metrics HTTP API and persists the metrics in
-// PostgreSQL, in a JSON file or in memory. Settings come from flags and are
-// overridden by the ADDRESS, STORE_INTERVAL, FILE_STORAGE_PATH, RESTORE,
-// DATABASE_DSN and KEY environment variables. When KEY is non-empty, the
-// server verifies request bodies and signs response bodies with HMAC-SHA256
-// using the HashSHA256 HTTP header.
+// Server serves the metrics HTTP API and keeps the metrics in PostgreSQL, in
+// a JSON file or in memory. The endpoints are described in
+// [github.com/rebusman/svcmetrics/internal/handler].
+//
+// Usage:
+//
+//	server [flags]
+//
+// Every setting comes from a flag, and an environment variable that is set
+// overrides it:
+//
+//	-a           ADDRESS            address to listen on (localhost:8080)
+//	-i           STORE_INTERVAL     seconds between saves to the file, 0 to save
+//	                                on every update (300)
+//	-f           FILE_STORAGE_PATH  file the metrics are saved to
+//	                                (metrics_storage.json)
+//	-r           RESTORE            load the file on startup (false)
+//	-d           DATABASE_DSN       PostgreSQL connection string; when set, the
+//	                                metrics live in the database and the file is
+//	                                not used
+//	-k           KEY                key for HMAC-SHA256 signatures
+//	-audit-file  AUDIT_FILE         file the audit log is appended to
+//	-audit-url   AUDIT_URL          URL the audit events are posted to
+//
+// The storage is PostgreSQL when a DSN is given, the file when its path is
+// non-empty and memory alone otherwise.
+//
+// With a key, the server verifies the signature of every signed request body
+// and signs every response body; the digest travels in the HashSHA256 header.
+// Each audit receiver that is configured gets an event for every request
+// whose metrics were stored: their names, the time and the client address.
+//
+// SIGINT and SIGTERM stop the server gracefully: it lets the requests in
+// flight finish, delivers the queued audit events and saves the metrics to the
+// file before it exits.
 package main
 
 import (
@@ -20,11 +49,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
+	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/rebusman/svcmetrics/internal/retry"
-	"github.com/sirupsen/logrus"
 )
 
 // responseWriter records the status code, the body size and the first failed
@@ -180,6 +211,8 @@ func main() {
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
 	key := flag.String("k", "", "key for signing request and response bodies")
+	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
+	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
 	flag.Parse()
 
 	log := logrus.New()
@@ -217,6 +250,17 @@ func main() {
 	if envKey := os.Getenv("KEY"); envKey != "" {
 		*key = envKey
 	}
+	if envAuditFile := os.Getenv("AUDIT_FILE"); envAuditFile != "" {
+		*auditFile = envAuditFile
+	}
+	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
+		*auditURL = envAuditURL
+	}
+
+	auditor, closeAudit, err := newAuditor(log, *auditFile, *auditURL)
+	if err != nil {
+		log.Fatalf("Failed to initialize audit: %v", err)
+	}
 
 	var (
 		hs        repository.Storage
@@ -226,7 +270,7 @@ func main() {
 
 	switch {
 	case *databaseDSN != "":
-		initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		initCtx, cancel := context.WithTimeout(context.Background(), dbInitTimeout)
 		pg, err := repository.NewPgStorage(initCtx, *databaseDSN)
 		cancel()
 		if err != nil {
@@ -268,17 +312,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key)
+	r := newRouter(log, hs, pinger, *key, auditor)
 
-	// The write timeout sits above requestTimeout on purpose: the router gives
-	// up on a request first and answers 504, and the connection is only dropped
-	// if even that answer does not get out in time.
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      requestTimeout + 3*time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
 	}
 
 	go func() {
@@ -306,20 +347,99 @@ func main() {
 
 	<-ctx.Done()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err := srv.Shutdown(shutdownCtx)
+	// The steps below follow the budget declared next to requestTimeout:
+	// shutdownGrace, auditDrainTimeout and storageSaveTimeout in turn.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	err = srv.Shutdown(shutdownCtx)
 	cancel()
 	if err != nil {
 		log.Errorf("Server shutdown failed: %v", err)
 	}
 
+	// The server no longer accepts requests, so no new events can appear:
+	// try to deliver the queued ones before the process exits. The attempt is
+	// bounded, so with a slow receiver the rest of the queue is lost, and
+	// closeAudit logs that.
+	closeAudit()
+
 	if fileStore != nil {
-		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		saveCtx, cancel := context.WithTimeout(context.Background(), storageSaveTimeout)
 		if err := fileStore.Save(saveCtx, *fileStoragePath); err != nil {
 			log.Errorf("Failed to save metrics to %s on shutdown: %v", *fileStoragePath, err)
 		}
 		cancel()
 	}
+}
+
+// newAuditor builds the audit publisher with an observer for every configured
+// receiver: the file at path and the server at rawURL. With neither configured
+// the audit is disabled and the auditor is a plain nil interface — never a nil
+// *audit.Publisher, which would not compare equal to nil in the handlers.
+//
+// The returned function drains the queued events, within a bound, and then
+// releases the receivers; a drain that runs out of time leaves the audit file
+// open for the process exit to close, since a write still in progress could
+// otherwise hold up the shutdown for good. When the error is nil, the function
+// is never nil, even with the audit disabled. On error nothing is left open and
+// both other results are nil.
+func newAuditor(log *logrus.Logger, path, rawURL string) (handler.Auditor, func(), error) {
+	var observers []audit.Observer
+	var fileObserver *audit.FileObserver
+
+	if path != "" {
+		o, err := audit.NewFileObserver(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		fileObserver = o
+		observers = append(observers, o)
+		log.Infof("Audit log written to %s", path)
+	}
+
+	if rawURL != "" {
+		o, err := audit.NewHTTPObserver(rawURL, nil)
+		if err != nil {
+			if fileObserver != nil {
+				_ = fileObserver.Close()
+			}
+			return nil, nil, err
+		}
+		observers = append(observers, o)
+		log.Infof("Audit log sent to %s", o.Name())
+	}
+
+	if len(observers) == 0 {
+		return nil, func() {}, nil
+	}
+
+	publisher := audit.NewPublisher(func(observer string, err error) {
+		if errors.Is(err, audit.ErrQueueFull) {
+			log.Errorf("Audit event lost for %s: %v", observer, err)
+			return
+		}
+		log.Errorf("Failed to deliver audit event to %s: %v", observer, err)
+	})
+	for _, o := range observers {
+		publisher.Register(o)
+	}
+
+	closeAudit := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), auditDrainTimeout)
+		defer cancel()
+		if err := publisher.Close(ctx); err != nil {
+			// Delivery is still running, possibly stuck in a write to the
+			// file that holds the observer's lock, which Close would wait on
+			// without a bound. The file is left to the process exit to close.
+			log.Errorf("Failed to flush audit events: %v", err)
+			return
+		}
+		if fileObserver != nil {
+			if err := fileObserver.Close(); err != nil {
+				log.Errorf("Failed to close audit file: %v", err)
+			}
+		}
+	}
+	return publisher, closeAudit, nil
 }
 
 // retryLogger adapts log to [retry.OnRetry], naming the operation being

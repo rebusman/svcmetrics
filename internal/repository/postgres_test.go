@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
-	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 // One throwaway Postgres serves the whole package: booting a container per test

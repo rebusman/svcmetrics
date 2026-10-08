@@ -10,11 +10,12 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 )
 
-// listTmpl renders the HTML page served by ListHandler.
+// listTmpl renders the HTML page served by [ListHandler].
 var listTmpl = template.Must(template.New("metrics").Parse(`
 <html>
 <head><title>Metrics</title></head>

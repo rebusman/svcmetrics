@@ -61,8 +61,7 @@ func TestReadOfDirectoryIsRetriedOnWindows(t *testing.T) {
 		t.Fatal("reading a directory was expected to fail")
 	}
 
-	var pathErr *fs.PathError
-	if !errors.As(err, &pathErr) || pathErr.Err != errorInvalidFunction {
+	if !errors.Is(err, errorInvalidFunction) {
 		t.Skipf("Windows no longer reports ERROR_INVALID_FUNCTION here: %v", err)
 	}
 	if !isRetriableFileError(err) {

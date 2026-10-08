@@ -1,5 +1,25 @@
 // Package handler implements the HTTP handlers of the metrics server together
-// with the gzip middleware they rely on.
+// with the middleware they rely on.
+//
+// The endpoints, as the server mounts them:
+//
+//	POST /update/{type}/{name}/{value}  store one metric given in the path   [UpdateHandler]
+//	POST /update                        store one metric given in JSON       [UpdateJSONHandler]
+//	POST /updates/                      store a JSON batch atomically        [UpdatesJSONHandler]
+//	GET  /value/{type}/{name}           read one metric as plain text        [ValueHandler]
+//	POST /value                         read one metric as JSON              [ValueJSONHandler]
+//	GET  /                              list every metric as an HTML page    [ListHandler]
+//	GET  /ping                          check the database connection        [PingHandler]
+//
+// A metric type is "gauge" or "counter"; the JSON form is [models.Metrics].
+// Storage errors map to statuses the same way everywhere: 404 for an unknown
+// metric, 400 for a malformed one, 504 for a request past its deadline and 500
+// for anything else.
+//
+// [GzipRequestMiddleware] and [GzipResponseMiddleware] compress the traffic,
+// [HashMiddleware] verifies request signatures and signs responses, and a
+// non-nil [Auditor] is told about every stored metric. The examples show each
+// endpoint at work.
 package handler
 
 import (
@@ -12,6 +32,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 )
@@ -34,8 +55,8 @@ func writeStorageError(w http.ResponseWriter, err error) {
 
 // UpdateJSONHandler handles POST /update: a single metric in JSON. It answers
 // with the stored metric, 400 for a malformed request and 500 for a storage
-// failure.
-func UpdateJSONHandler(s repository.Storage) http.HandlerFunc {
+// failure. A stored metric is reported to a, which may be nil.
+func UpdateJSONHandler(s repository.Storage, a Auditor) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var m models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
@@ -87,6 +108,8 @@ func UpdateJSONHandler(s repository.Storage) http.HandlerFunc {
 			return
 		}
 
+		notifyAudit(a, r, []string{m.ID})
+
 		var payload bytes.Buffer
 		if err := json.NewEncoder(&payload).Encode(result); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -102,8 +125,9 @@ func UpdateJSONHandler(s repository.Storage) http.HandlerFunc {
 // UpdatesJSONHandler handles POST /updates/: a batch of metrics stored in a
 // single atomic write. An empty batch is accepted as a no-op, a malformed one
 // (including a bare null instead of an array) is rejected in full with 400. The
-// single-metric endpoints keep working alongside it.
-func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
+// single-metric endpoints keep working alongside it. A stored batch is reported
+// to a, which may be nil; an empty one stores nothing and is not reported.
+func UpdatesJSONHandler(s repository.Storage, a Auditor) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var batch []models.Metrics
 		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
@@ -128,6 +152,12 @@ func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
 				writeStorageError(w, err)
 				return
 			}
+
+			names := make([]string, len(batch))
+			for i, m := range batch {
+				names[i] = m.ID
+			}
+			notifyAudit(a, r, names)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -137,8 +167,8 @@ func UpdatesJSONHandler(s repository.Storage) http.HandlerFunc {
 }
 
 // UpdateHandler handles POST /update/{type}/{name}/{value}: a single metric
-// passed in the path.
-func UpdateHandler(s repository.Storage) http.HandlerFunc {
+// passed in the path. A stored metric is reported to a, which may be nil.
+func UpdateHandler(s repository.Storage, a Auditor) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		mType := chi.URLParam(r, "type")
 		mName := chi.URLParam(r, "name")
@@ -176,6 +206,8 @@ func UpdateHandler(s repository.Storage) http.HandlerFunc {
 			http.Error(w, "Invalid metric type", http.StatusBadRequest)
 			return
 		}
+
+		notifyAudit(a, r, []string{mName})
 
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)

@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
+
+	models "github.com/rebusman/svcmetrics/internal/model"
 )
 
 // CollectSystemMetrics reads the memory and per-CPU statistics of the host into

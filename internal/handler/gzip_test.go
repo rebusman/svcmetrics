@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -343,5 +345,70 @@ func TestGzipResponseMiddlewareSetsVaryHeader(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("Vary header = %v, want contains Accept-Encoding", vary)
+	}
+}
+
+// TestGzipMiddlewareReusesPooledCoders runs many requests, some of them with a
+// body that is not gzip, through both middlewares at once. Every valid one must
+// come back intact: a pooled decompressor or compressor that kept state from a
+// previous request, or that two requests got at the same time, would corrupt
+// the stream.
+func TestGzipMiddlewareReusesPooledCoders(t *testing.T) {
+	echo := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	h := GzipRequestMiddleware(GzipResponseMiddleware(echo))
+
+	const workers, requests = 8, 25
+	errs := make(chan error, workers*requests)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			for i := range requests {
+				if i%5 == 4 {
+					req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("not gzip"))
+					req.Header.Set("Content-Encoding", "gzip")
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, req)
+					if rec.Code != http.StatusBadRequest {
+						errs <- fmt.Errorf("broken body: status = %d, want 400", rec.Code)
+					}
+					continue
+				}
+
+				want := fmt.Sprintf(`{"worker":%d,"request":%d,"pad":%q}`, w, i, strings.Repeat("x", i*40))
+				req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(gzipBytes(t, want)))
+				req.Header.Set("Content-Encoding", "gzip")
+				req.Header.Set("Accept-Encoding", "gzip")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+
+				zr, err := gzip.NewReader(rec.Body)
+				if err != nil {
+					errs <- fmt.Errorf("response is not gzip: %w", err)
+					continue
+				}
+				got, err := io.ReadAll(zr)
+				if err != nil {
+					errs <- fmt.Errorf("read response: %w", err)
+					continue
+				}
+				if string(got) != want {
+					errs <- fmt.Errorf("response = %q, want %q", got, want)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
 	}
 }

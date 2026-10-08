@@ -42,3 +42,85 @@ git fetch template && git checkout template/v2 .github
 - **Clean Architecture**
 - **Hexagonal Architecture**
 - **Layered Architecture**
+
+
+## Бенчмарки и оптимизация памяти
+
+### Бенчмарки
+
+Бенчмарки покрывают ключевые компоненты системы:
+
+| Пакет | Бенчмарки | Что измеряют |
+|---|---|---|
+| `internal/repository` | `BenchmarkMemStorage*`, `BenchmarkAggregateBatch` | запись и чтение in-memory хранилища, валидация и свёртка батча |
+| `internal/handler` | `BenchmarkUpdatesJSONHandler`, `BenchmarkUpdateJSONHandler`, `BenchmarkValueJSONHandler`, `BenchmarkListHandler`, `BenchmarkSignedGzipBatch` | обработчики и цепочка «проверка подписи → распаковка → обработчик → сжатие → подпись ответа» |
+| `internal/hashing` | `BenchmarkSum`, `BenchmarkEqual` | HMAC-SHA256 подпись и её проверка |
+| `internal/agent` | `BenchmarkCollectRuntimeMetrics`, `BenchmarkCollectBatch`, `BenchmarkSendBatch`, `BenchmarkGzipCompress*` | сбор метрик, формирование и отправка батча |
+| `cmd/server` | `BenchmarkAgentReport` | вся система: агент собирает метрики и отправляет подписанный gzip-батч в production-роутер сервера, который его проверяет, распаковывает, сохраняет и пишет в аудит |
+
+Запуск:
+
+```
+go test -run '^$' -bench . -benchmem ./...
+```
+
+### Профилирование
+
+Профили памяти сняты со сквозного бенчмарка `BenchmarkAgentReport`. Число итераций фиксировано: суммарный объём аллокаций растёт вместе с ним, и без фиксации профили `base` и `result` нельзя было бы сравнить. `-memprofilerate 1` записывает каждую аллокацию, а не выборку:
+
+```
+go test -run '^$' -bench BenchmarkAgentReport -benchmem -benchtime 2000x     -memprofilerate 1 -memprofile profiles/base.pprof ./cmd/server
+```
+
+`profiles/result.pprof` снят той же командой после оптимизации.
+
+### Что нашёл профиль и что исправлено
+
+Анализ проводился командами `top`, `peek`, `list` в `go tool pprof profiles/base.pprof`:
+
+1. **`compress/flate.NewWriter` — 83 % всей выделенной памяти.** `GzipResponseMiddleware` создавал новый gzip-компрессор (около 800 КБ таблиц) на каждый ответ, даже на `{"status":"ok"}` из 15 байт. Компрессоры теперь берутся из `sync.Pool`.
+2. **`compress/gzip.NewReader` — 9 %.** Половину создавал `GzipRequestMiddleware` на каждый запрос: декомпрессоры теперь тоже в пуле, вместе с `bufio.Reader`, в который `gzip.Reader.Reset` иначе каждый раз заворачивает тело запроса. Вторую половину создавал HTTP-клиент агента, распаковывая ответ сервера, который агент даже не читает: агент теперь отправляет `Accept-Encoding: identity`, и сервер не сжимает ему ответ.
+3. **`repository.aggregateBatch`** выделял по отдельному `float64`/`int64` на каждую метрику батча и использовал `sort.Slice` (рефлексия). Значения теперь лежат в двух слайсах, выделенных разом, сортировка — `slices.SortFunc`: 39 аллокаций на батч из 32 метрик → 6.
+4. **Агент:** `CollectRuntimeMetrics` строил и выбрасывал промежуточную карту на каждом опросе — теперь значения пишутся прямо в состояние (936 B → 0). `collectBatch` копировал карту gauge-метрик, отдельно сортировал ключи и выделял по указателю на каждую метрику — теперь батч собирается прямо из состояния (45 аллокаций → 3). JSON батча кодируется сразу в gzip-компрессор без промежуточного буфера, URL `/updates/` строится один раз, а не через `fmt.Sprintf` на каждую отправку.
+
+### Результаты бенчмарков
+
+| Бенчмарк | До | После |
+|---|---|---|
+| `BenchmarkAgentReport` | 452 µs, 1 149 323 B, 451 allocs | 195 µs, 40 125 B, 302 allocs |
+| `BenchmarkSignedGzipBatch` | 132 µs, 881 082 B, 222 allocs | 40 µs, 30 139 B, 165 allocs |
+| `BenchmarkUpdatesJSONHandler` | 21 µs, 18 301 B, 172 allocs | 20 µs, 18 438 B, 139 allocs |
+| `BenchmarkAggregateBatch` | 3.8 µs, 4 896 B, 39 allocs | 3.2 µs, 5 032 B, 6 allocs |
+| `BenchmarkCollectRuntimeMetrics` | 11.8 µs, 936 B, 3 allocs | 10.6 µs, 0 B, 0 allocs |
+| `BenchmarkCollectBatch` | 3.2 µs, 3 952 B, 45 allocs | 1.4 µs, 1 640 B, 3 allocs |
+
+### Сравнение профилей
+
+```
+$ go tool pprof -top -nodecount=12 -diff_base= profiles/base.pprof profiles/result.pprof
+Showing nodes accounting for -1819.46MB, 94.67% of 1921.82MB total
+      flat  flat%   sum%        cum   cum%
+-1300.43MB 67.67% 67.67% -1581.14MB 82.27%  compress/flate.NewWriter (inline)
+ -272.93MB 14.20% 81.87%  -272.93MB 14.20%  compress/flate.(*compressor).initDeflate (inline)
+ -123.56MB  6.43% 88.30%  -123.56MB  6.43%  compress/flate.(*dictDecoder).init (inline)
+  -33.78MB  1.76% 90.06%   -33.78MB  1.76%  sync.(*Pool).pinSlow
+  -29.08MB  1.51% 91.57%  -152.64MB  7.94%  compress/flate.NewReader
+  -24.62MB  1.28% 92.85%   -24.62MB  1.28%  net/http.init.func15
+  -15.81MB  0.82% 93.67%   -15.81MB  0.82%  bufio.NewReaderSize (inline)
+  -13.55MB   0.7% 94.38%   -13.55MB   0.7%  compress/flate.(*huffmanEncoder).generate
+   -2.93MB  0.15% 94.53%    -9.91MB  0.52%  encoding/json.Marshal
+   -2.69MB  0.14% 94.67%  -173.10MB  9.01%  compress/gzip.NewReader (inline)
+   -0.05MB 0.0024% 94.67% -1552.44MB 80.78%  github.com/rebusman/svcmetrics/internal/handler.GzipResponseMiddleware.func1
+   -0.03MB 0.0016% 94.67%  -147.64MB  7.68%  github.com/rebusman/svcmetrics/internal/agent.(*Agent).sendBatch
+```
+
+
+```
+$ go tool pprof -top -sample_index=alloc_objects -focus=aggregateBatch -diff_base profiles/base.pprof profiles/result.pprof
+Showing nodes accounting for -30003, 4.12% of 728034 total
+      flat  flat%   sum%        cum   cum%
+    -28003  3.85%  3.85%     -28003  3.85%  github.com/rebusman/svcmetrics/internal/repository.copyMetric (inline)
+     -4000  0.55%  4.40%      -4000  0.55%  internal/reflectlite.Swapper
+      2000  0.27%  4.12%     -30003  4.12%  github.com/rebusman/svcmetrics/internal/repository.aggregateBatch
+```
+
