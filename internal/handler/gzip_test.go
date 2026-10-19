@@ -131,7 +131,7 @@ func TestGzipRequestMiddlewareReusesKeepAliveConnection(t *testing.T) {
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 			t.Fatalf("request %d drain: %v", i, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("request %d: status = %d, want 200", i, resp.StatusCode)
 		}
@@ -175,7 +175,7 @@ func TestGzipRequestMiddlewareKeepsConnectionWhenHandlerSkipsBody(t *testing.T) 
 			t.Fatalf("request %d: %v", i, err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("request %d: status = %d, want 200", i, resp.StatusCode)
 		}
