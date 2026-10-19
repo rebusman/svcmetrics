@@ -91,7 +91,7 @@ func (o *HTTPObserver) Update(ctx context.Context, e Event) error {
 	if err != nil {
 		return fmt.Errorf("send audit event: %w", o.redact(err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Draining the body lets the client reuse the connection.
 	_, _ = io.Copy(io.Discard, resp.Body)
 
