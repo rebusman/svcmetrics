@@ -223,7 +223,7 @@ func TestGzipResponseWriterFlush(t *testing.T) {
 	rec := httptest.NewRecorder()
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gw}
+	grw := &gzipResponseWriter{ResponseWriter: rec, writer: &gzipWriter{Writer: gw}}
 
 	rec.Header().Set("Content-Type", "application/json")
 	rec.Header().Set("Content-Encoding", "gzip")
@@ -253,7 +253,7 @@ func TestGzipResponseWriterFlush(t *testing.T) {
 
 func TestGzipResponseWriterHijackProxy(t *testing.T) {
 	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
-	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gzip.NewWriter(bytes.NewBuffer(nil))}
+	grw := &gzipResponseWriter{ResponseWriter: rec, writer: &gzipWriter{Writer: gzip.NewWriter(bytes.NewBuffer(nil))}}
 
 	_, _, err := grw.Hijack()
 	if err != nil {
@@ -266,7 +266,7 @@ func TestGzipResponseWriterHijackProxy(t *testing.T) {
 
 func TestGzipResponseWriterPushNotSupported(t *testing.T) {
 	rec := httptest.NewRecorder()
-	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gzip.NewWriter(bytes.NewBuffer(nil))}
+	grw := &gzipResponseWriter{ResponseWriter: rec, writer: &gzipWriter{Writer: gzip.NewWriter(bytes.NewBuffer(nil))}}
 
 	err := grw.Push("/asset.js", nil)
 	if !errors.Is(err, http.ErrNotSupported) {
@@ -278,7 +278,7 @@ func TestGzipResponseWriterCompressesWithCharset(t *testing.T) {
 	rec := httptest.NewRecorder()
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
-	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gw}
+	grw := &gzipResponseWriter{ResponseWriter: rec, writer: &gzipWriter{Writer: gw}}
 
 	rec.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if _, err := grw.Write([]byte("hello")); err != nil {
@@ -305,7 +305,7 @@ func TestGzipResponseWriterCompressesWithCharset(t *testing.T) {
 
 func TestGzipResponseWriterWriteHeaderClearsContentLength(t *testing.T) {
 	rec := httptest.NewRecorder()
-	grw := &gzipResponseWriter{ResponseWriter: rec, writer: gzip.NewWriter(bytes.NewBuffer(nil))}
+	grw := &gzipResponseWriter{ResponseWriter: rec, writer: &gzipWriter{Writer: gzip.NewWriter(bytes.NewBuffer(nil))}}
 
 	rec.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rec.Header().Set("Content-Length", "5")

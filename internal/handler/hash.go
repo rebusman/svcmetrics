@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/rebusman/svcmetrics/internal/hashing"
+	"github.com/rebusman/svcmetrics/internal/pool"
 )
 
 // maxSignedBodySize caps the request body the signature check is willing to
@@ -22,6 +23,8 @@ const maxSignedBodySize = 10 << 20 // 10 MiB
 // deliberately implements neither [http.Flusher] nor [http.Hijacker]: a
 // response that has to reach the client in pieces cannot be signed as a whole,
 // and a hijacked connection leaves the middleware nothing to sign.
+//
+// generate:reset
 type hashResponseWriter struct {
 	header      http.Header
 	body        bytes.Buffer
@@ -29,8 +32,16 @@ type hashResponseWriter struct {
 	wroteHeader bool
 }
 
+// hashResponseWriterPool recycles the response buffers, keeping the header map
+// and the body buffer's capacity between requests.
+var hashResponseWriterPool = pool.New(func() *hashResponseWriter {
+	return &hashResponseWriter{header: make(http.Header)}
+})
+
 func newHashResponseWriter() *hashResponseWriter {
-	return &hashResponseWriter{header: make(http.Header), status: http.StatusOK}
+	w := hashResponseWriterPool.Get()
+	w.status = http.StatusOK
+	return w
 }
 
 // Header returns the buffered response headers.
@@ -106,6 +117,7 @@ func HashMiddleware(key string) func(http.Handler) http.Handler {
 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rw := newHashResponseWriter()
+			defer hashResponseWriterPool.Put(rw)
 
 			sig := r.Header.Get(hashing.Header)
 			if unsigned(sig) {
