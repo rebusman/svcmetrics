@@ -2,6 +2,9 @@
 // a JSON file or in memory. The endpoints are described in
 // [github.com/rebusman/svcmetrics/internal/handler].
 //
+// With -crypto-key or CRYPTO_KEY, load a PEM RSA private key for request encryption.
+// CRYPTO_KEY overrides the flag; an invalid key stops startup.
+//
 // Usage:
 //
 //	server [flags]
@@ -19,6 +22,7 @@
 //	                                metrics live in the database and the file is
 //	                                not used
 //	-k           KEY                key for HMAC-SHA256 signatures
+//	-crypto-key  CRYPTO_KEY         path to a PEM RSA private key
 //	-audit-file  AUDIT_FILE         file the audit log is appended to
 //	-audit-url   AUDIT_URL          URL the audit events are posted to
 //
@@ -38,6 +42,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rsa"
 	"errors"
 	"flag"
 	"fmt"
@@ -52,6 +57,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rebusman/svcmetrics/internal/audit"
+	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
@@ -215,6 +221,7 @@ func main() {
 	key := flag.String("k", "", "key for signing request and response bodies")
 	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
 	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
+	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
 	flag.Parse()
 
 	log := logrus.New()
@@ -257,6 +264,18 @@ func main() {
 	}
 	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
 		*auditURL = envAuditURL
+	}
+
+	if env := os.Getenv("CRYPTO_KEY"); env != "" {
+		*cryptoKey = env
+	}
+	var privateKey *rsa.PrivateKey
+	if *cryptoKey != "" {
+		var err error
+		privateKey, err = payloadcrypto.LoadPrivateKey(*cryptoKey)
+		if err != nil {
+			log.Fatalf("Failed to load crypto key: %v", err)
+		}
 	}
 
 	auditor, closeAudit, err := newAuditor(log, *auditFile, *auditURL)
@@ -314,7 +333,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key, auditor)
+	r := newRouter(log, hs, pinger, *key, auditor, privateKey)
 
 	srv := &http.Server{
 		Addr:              *addr,

@@ -2,6 +2,9 @@
 // server in gzip-compressed batches. The collection and reporting are
 // described in [github.com/rebusman/svcmetrics/internal/agent].
 //
+// With -crypto-key or CRYPTO_KEY, load a PEM RSA public key for request encryption.
+// CRYPTO_KEY overrides the flag; an invalid key stops startup.
+//
 // Usage:
 //
 //	agent [flags]
@@ -16,15 +19,18 @@
 //	-b  BATCH_SIZE       metrics per request (32)
 //	-l  RATE_LIMIT       requests in flight at once (1)
 //	-k  KEY              key for HMAC-SHA256 signatures
+//	-crypto-key  CRYPTO_KEY         path to a PEM RSA public key
 //
 // With a key, every request body is signed as sent, after compression, and the
-// hexadecimal digest travels in the HashSHA256 header.
+// hexadecimal digest travels in the HashSHA256 header. When encryption is
+// enabled, the signature covers the encrypted body.
 //
 // SIGINT and SIGTERM stop the agent.
 package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"flag"
 	"log"
 	"os"
@@ -35,6 +41,7 @@ import (
 	"time"
 
 	"github.com/rebusman/svcmetrics/internal/agent"
+	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 )
 
 // logRetry reports a failed report that the agent is about to repeat, so that
@@ -60,7 +67,19 @@ func main() {
 	batchSize := flag.Int("b", agent.DefaultBatchSize, "number of metrics per batch request")
 	rateLimit := flag.Int("l", agent.DefaultRateLimit, "maximum number of concurrent requests to the server")
 	key := flag.String("k", "", "key for signing request bodies")
+	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA public key")
 	flag.Parse()
+	if env := os.Getenv("CRYPTO_KEY"); env != "" {
+		*cryptoKey = env
+	}
+	var publicKey *rsa.PublicKey
+	if *cryptoKey != "" {
+		var err error
+		publicKey, err = payloadcrypto.LoadPublicKey(*cryptoKey)
+		if err != nil {
+			log.Fatalf("Failed to load crypto key: %v", err)
+		}
+	}
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
@@ -116,6 +135,7 @@ func main() {
 		*key,
 		*rateLimit,
 	)
+	a.SetPublicKey(publicKey)
 	a.SetOnRetry(logRetry)
 	a.SetOnError(logError)
 	a.Run(ctx)
