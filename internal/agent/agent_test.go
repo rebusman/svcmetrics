@@ -103,13 +103,14 @@ func TestPooledGzipWriterDoesNotRetainRequestBuffer(t *testing.T) {
 		t.Fatalf("sendBatch error = %v", err)
 	}
 
-	gw := gzipWriterPool.Get().(*gzip.Writer)
-	defer func() {
-		gw.Reset(io.Discard)
-		gzipWriterPool.Put(gw)
-	}()
+	enc := batchEncoderPool.Get()
+	defer batchEncoderPool.Put(enc)
 
-	dest := reflect.ValueOf(gw).Elem().FieldByName("w")
+	if enc.buf.Len() != 0 {
+		t.Fatalf("pooled buffer still holds %d bytes of the request payload", enc.buf.Len())
+	}
+
+	dest := reflect.ValueOf(enc.gw).Elem().FieldByName("w")
 	if !dest.IsValid() || dest.Kind() != reflect.Interface {
 		t.Skip("gzip.Writer has no inspectable destination field anymore")
 	}
@@ -129,18 +130,16 @@ var benchPayload = []byte(`[{"id":"Alloc","type":"gauge","value":123456.789}]`)
 func BenchmarkGzipCompressPooled(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		var buf bytes.Buffer
-		gw := gzipWriterPool.Get().(*gzip.Writer)
-		gw.Reset(&buf)
-		if _, err := gw.Write(benchPayload); err != nil {
+		enc := batchEncoderPool.Get()
+		enc.gw.Reset(&enc.buf)
+		if _, err := enc.gw.Write(benchPayload); err != nil {
 			b.Fatal(err)
 		}
-		if err := gw.Close(); err != nil {
+		if err := enc.gw.Close(); err != nil {
 			b.Fatal(err)
 		}
-		gw.Reset(io.Discard)
-		gzipWriterPool.Put(gw)
-		_ = buf.Bytes()
+		_ = enc.buf.Bytes()
+		batchEncoderPool.Put(enc)
 	}
 }
 

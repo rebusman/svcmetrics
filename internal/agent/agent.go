@@ -27,6 +27,7 @@ import (
 
 	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
+	"github.com/rebusman/svcmetrics/internal/pool"
 	"github.com/rebusman/svcmetrics/internal/retry"
 )
 
@@ -47,12 +48,24 @@ const (
 	DefaultRateLimit = 1
 )
 
-// gzipWriterPool recycles the compressors used for the request bodies.
-var gzipWriterPool = sync.Pool{
-	New: func() any {
-		return gzip.NewWriter(nil)
-	},
+// batchEncoder is the buffer a request body is compressed into together with
+// the compressor writing into it. Both are reused between batches.
+type batchEncoder struct {
+	buf bytes.Buffer
+	gw  *gzip.Writer
 }
+
+// Reset empties the buffer and points the compressor at [io.Discard], so a
+// pooled encoder never pins the payload it compressed.
+func (e *batchEncoder) Reset() {
+	e.buf.Reset()
+	e.gw.Reset(io.Discard)
+}
+
+// batchEncoderPool recycles the encoders used for the request bodies.
+var batchEncoderPool = pool.New(func() *batchEncoder {
+	return &batchEncoder{gw: gzip.NewWriter(io.Discard)}
+})
 
 // metricState is the set of metrics collected so far.
 type metricState struct {
@@ -439,32 +452,27 @@ func (a *Agent) returnCounters(metrics []models.Metrics) {
 // [hashing.Header] — the server verifies the request before it decompresses
 // it, so the JSON behind the gzip is the wrong thing to sign. An empty batch is
 // never sent. The
-// compressor comes from a pool and is pointed back at [io.Discard] before it is
-// returned, so a pooled writer never pins the payload it compressed; the
-// response body is drained so the transport can reuse the connection for the
+// buffer and the compressor come from a pool and are reset before they are
+// returned, after the response body is closed; the response body is drained so the transport can reuse the connection for the
 // next batch.
 func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
 	}
 
-	var buf bytes.Buffer
-	gw := gzipWriterPool.Get().(*gzip.Writer)
-	defer func() {
-		gw.Reset(io.Discard)
-		gzipWriterPool.Put(gw)
-	}()
-	gw.Reset(&buf)
+	enc := batchEncoderPool.Get()
+	defer batchEncoderPool.Put(enc)
+	enc.gw.Reset(&enc.buf)
 
 	// The JSON is encoded straight into the compressor, so the uncompressed
 	// body never exists as a whole.
-	if err := json.NewEncoder(gw).Encode(metrics); err != nil {
+	if err := json.NewEncoder(enc.gw).Encode(metrics); err != nil {
 		return err
 	}
-	if err := gw.Close(); err != nil {
+	if err := enc.gw.Close(); err != nil {
 		return err
 	}
-	body := buf.Bytes()
+	body := enc.buf.Bytes()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.updatesURL, bytes.NewReader(body))
 	if err != nil {

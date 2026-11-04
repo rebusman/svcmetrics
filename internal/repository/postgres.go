@@ -39,7 +39,7 @@ func NewPgStorage(ctx context.Context, dsn string) (*PgStorage, error) {
 	s := &PgStorage{db: db, retry: retry.Config{Retriable: isRetriablePgError}}
 
 	if err := retry.Do(ctx, s.retry, db.PingContext); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
@@ -47,7 +47,7 @@ func NewPgStorage(ctx context.Context, dsn string) (*PgStorage, error) {
 		return migrations.Up(ctx, db)
 	})
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -236,7 +236,7 @@ func (s *PgStorage) GetAllGauges(ctx context.Context) (map[string]float64, error
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		res := make(map[string]float64)
 		for rows.Next() {
@@ -265,7 +265,7 @@ func (s *PgStorage) GetAllCounters(ctx context.Context) (map[string]int64, error
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		res := make(map[string]int64)
 		for rows.Next() {

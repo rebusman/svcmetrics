@@ -169,17 +169,17 @@ func (s *MemStorage) save(path string) error {
 	tmpName := tmp.Name()
 
 	if err := writeAndClose(tmp, data); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 
 	if err := os.Chmod(tmpName, 0644); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 
 	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return nil
@@ -189,11 +189,11 @@ func (s *MemStorage) save(path string) error {
 // matters: without it a rename can land before the contents do.
 func writeAndClose(f *os.File, data []byte) error {
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

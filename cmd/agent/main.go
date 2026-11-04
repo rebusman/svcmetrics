@@ -52,6 +52,8 @@ func logError(err error) {
 // main wires the settings together and runs the agent until the process is
 // asked to stop.
 func main() {
+	printBuildInfo(os.Stdout)
+
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	reportInterval := flag.Int("r", 10, "report interval in seconds")
 	pollInterval := flag.Int("p", 2, "poll interval in seconds")

@@ -68,8 +68,8 @@ func (h *hijackableRecorder) Push(target string, _ *http.PushOptions) error {
 // optional interfaces it implements.
 func TestResponseWriterForwardsOptionalInterfaces(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
 
 	inner := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), conn: serverConn}
 	rw := &responseWriter{ResponseWriter: inner, statusCode: http.StatusOK}

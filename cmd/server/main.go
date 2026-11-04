@@ -205,6 +205,8 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 // written here rather than in the saver goroutine, so the process cannot exit
 // while that write is still in flight.
 func main() {
+	printBuildInfo(os.Stdout)
+
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	storeInterval := flag.Int("i", 300, "save interval in seconds")
 	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
