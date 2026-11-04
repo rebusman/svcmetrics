@@ -26,7 +26,7 @@
 // hexadecimal digest travels in the HashSHA256 header. When encryption is
 // enabled, the signature covers the encrypted body.
 //
-// SIGINT and SIGTERM stop the agent.
+// SIGINT, SIGTERM and SIGQUIT stop the agent.
 package main
 
 import (
@@ -138,7 +138,7 @@ func main() {
 		endpoint = "http://" + endpoint
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
 	a := agent.New(

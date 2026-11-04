@@ -174,40 +174,51 @@ func (a *Agent) reportError(err error) {
 	}
 }
 
-// Run collects and reports metrics until the context is cancelled, and returns
-// once every goroutine it started has stopped.
-//
-// The collectors, the reporter and the workers are separate goroutines joined
-// by a single channel of batches. Run drives the reporter itself and blocks,
-// as it did when all of this happened in one loop.
-//
-// The workers and the collectors stop on different signals — the workers when
-// the channel of batches closes, the collectors when the context is cancelled —
-// and neither has to outlive the other. A single [sync.WaitGroup] holds them
-// all, so the two kinds are joined at once rather than one pool after the
-// other, and nothing a worker does delays a collector's completion.
+// Run stops collecting on cancellation, finishes in-flight reports and sends
+// the remaining metrics before returning. Delivery gets a separate shutdown
+// budget so the signal does not cancel requests already being processed.
 func (a *Agent) Run(ctx context.Context) {
 	batches := make(chan []models.Metrics)
+	deliveryCtx, cancelDelivery := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelDelivery()
+	shutdownDone := make(chan struct{})
+	defer close(shutdownDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-shutdownDone:
+			return
+		}
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancelDelivery()
+		case <-shutdownDone:
+		}
+	}()
 
-	var running sync.WaitGroup
+	var workers, collectors sync.WaitGroup
 	for range a.rateLimit {
-		running.Go(func() {
-			a.work(ctx, batches)
-		})
+		workers.Go(func() { a.work(deliveryCtx, batches) })
 	}
-	running.Go(func() {
-		a.poll(ctx, a.collectRuntime)
-	})
-	running.Go(func() {
-		a.poll(ctx, a.CollectSystemMetrics)
-	})
+	collectors.Go(func() { a.poll(ctx, a.collectRuntime) })
+	collectors.Go(func() { a.poll(ctx, a.CollectSystemMetrics) })
 
 	a.report(ctx, batches)
-
-	// Only the reporter sends, so it is the one that may close the channel;
-	// the workers then finish what they are already holding and stop.
+	collectors.Wait()
 	close(batches)
-	running.Wait()
+	workers.Wait()
+
+	// Failed reports have returned their counter deltas by now. Include them
+	// together with everything collected since the last periodic report.
+	flush := make(chan []models.Metrics)
+	for range a.rateLimit {
+		workers.Go(func() { a.work(deliveryCtx, flush) })
+	}
+	a.enqueue(deliveryCtx, flush)
+	close(flush)
+	workers.Wait()
 }
 
 // collectRuntime adapts [Agent.CollectRuntimeMetrics] to the signature poll
@@ -234,7 +245,7 @@ func (a *Agent) poll(ctx context.Context, collect func(context.Context) error) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := collect(ctx); err != nil {
+			if err := collect(context.WithoutCancel(ctx)); err != nil {
 				a.reportError(err)
 			}
 		}

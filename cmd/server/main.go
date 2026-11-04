@@ -35,7 +35,7 @@
 // Each audit receiver that is configured gets an event for every request
 // whose metrics were stored: their names, the time and the client address.
 //
-// SIGINT and SIGTERM stop the server gracefully: it lets the requests in
+// SIGINT, SIGTERM and SIGQUIT stop the server gracefully: it lets the requests in
 // flight finish, delivers the queued audit events and saves the metrics to the
 // file before it exits.
 package main
@@ -350,7 +350,7 @@ func main() {
 		log.Info("Using in-memory storage")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
 	r := newRouter(log, hs, pinger, *key, auditor, privateKey)
@@ -369,8 +369,10 @@ func main() {
 		}
 	}()
 
+	saverDone := make(chan struct{})
 	if fileStore != nil && *storeInterval > 0 {
 		go func() {
+			defer close(saverDone)
 			ticker := time.NewTicker(*storeInterval)
 			defer ticker.Stop()
 			for {
@@ -384,6 +386,10 @@ func main() {
 				}
 			}
 		}()
+	}
+
+	if fileStore == nil || *storeInterval <= 0 {
+		close(saverDone)
 	}
 
 	<-ctx.Done()
@@ -403,6 +409,7 @@ func main() {
 	// closeAudit logs that.
 	closeAudit()
 
+	<-saverDone
 	if fileStore != nil {
 		saveCtx, cancel := context.WithTimeout(context.Background(), storageSaveTimeout)
 		if err := fileStore.Save(saveCtx, *fileStoragePath); err != nil {
