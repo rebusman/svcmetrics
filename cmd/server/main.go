@@ -9,6 +9,7 @@
 //
 //	server [flags]
 //
+// JSON settings from -c/-config or CONFIG provide defaults for flags.
 // Every setting comes from a flag, and an environment variable that is set
 // overrides it:
 //
@@ -57,6 +58,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rebusman/svcmetrics/internal/audit"
+	"github.com/rebusman/svcmetrics/internal/config"
 	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
@@ -214,7 +216,7 @@ func main() {
 	printBuildInfo(os.Stdout)
 
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
-	storeInterval := flag.Int("i", 300, "save interval in seconds")
+	storeInterval := config.Seconds(flag.CommandLine, "i", 300, "save interval (seconds or Go duration)")
 	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
@@ -222,7 +224,21 @@ func main() {
 	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
 	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
 	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
+	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
+	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"address":        "a",
+		"crypto_key":     "crypto-key",
+		"key":            "k",
+		"store_interval": "i",
+		"store_file":     "f",
+		"restore":        "r",
+		"database_dsn":   "d",
+		"audit_file":     "audit-file",
+		"audit_url":      "audit-url",
+	}); err != nil {
+		logrus.Fatal(err)
+	}
 
 	log := logrus.New()
 	log.SetFormatter(&logrus.TextFormatter{
@@ -238,11 +254,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid STORE_INTERVAL value %q: %v", envStoreInterval, err)
 		}
-		*storeInterval = v
+		*storeInterval = time.Duration(v) * time.Second
 	}
 
 	if envFileStoragePath := os.Getenv("FILE_STORAGE_PATH"); envFileStoragePath != "" {
 		*fileStoragePath = envFileStoragePath
+	}
+
+	if env := os.Getenv("STORE_FILE"); env != "" {
+		*fileStoragePath = env
 	}
 
 	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
@@ -351,7 +371,7 @@ func main() {
 
 	if fileStore != nil && *storeInterval > 0 {
 		go func() {
-			ticker := time.NewTicker(time.Duration(*storeInterval) * time.Second)
+			ticker := time.NewTicker(*storeInterval)
 			defer ticker.Stop()
 			for {
 				select {

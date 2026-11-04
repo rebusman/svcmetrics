@@ -9,6 +9,7 @@
 //
 //	agent [flags]
 //
+// JSON settings from -c/-config or CONFIG provide defaults for flags.
 // Every setting comes from a flag, and an environment variable that is set
 // overrides it:
 //
@@ -41,6 +42,7 @@ import (
 	"time"
 
 	"github.com/rebusman/svcmetrics/internal/agent"
+	"github.com/rebusman/svcmetrics/internal/config"
 	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 )
 
@@ -62,13 +64,25 @@ func main() {
 	printBuildInfo(os.Stdout)
 
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
-	reportInterval := flag.Int("r", 10, "report interval in seconds")
-	pollInterval := flag.Int("p", 2, "poll interval in seconds")
+	reportInterval := config.Seconds(flag.CommandLine, "r", 10, "report interval (seconds or Go duration)")
+	pollInterval := config.Seconds(flag.CommandLine, "p", 2, "poll interval (seconds or Go duration)")
 	batchSize := flag.Int("b", agent.DefaultBatchSize, "number of metrics per batch request")
 	rateLimit := flag.Int("l", agent.DefaultRateLimit, "maximum number of concurrent requests to the server")
 	key := flag.String("k", "", "key for signing request bodies")
 	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA public key")
+	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
+	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"address":         "a",
+		"crypto_key":      "crypto-key",
+		"key":             "k",
+		"report_interval": "r",
+		"poll_interval":   "p",
+		"batch_size":      "b",
+		"rate_limit":      "l",
+	}); err != nil {
+		log.Fatal(err)
+	}
 	if env := os.Getenv("CRYPTO_KEY"); env != "" {
 		*cryptoKey = env
 	}
@@ -87,7 +101,7 @@ func main() {
 
 	if envReport := os.Getenv("REPORT_INTERVAL"); envReport != "" {
 		if v, err := strconv.Atoi(envReport); err == nil {
-			*reportInterval = v
+			*reportInterval = time.Duration(v) * time.Second
 		} else {
 			log.Printf("Invalid REPORT_INTERVAL value: %s, using default\n", envReport)
 		}
@@ -95,7 +109,7 @@ func main() {
 
 	if envPoll := os.Getenv("POLL_INTERVAL"); envPoll != "" {
 		if v, err := strconv.Atoi(envPoll); err == nil {
-			*pollInterval = v
+			*pollInterval = time.Duration(v) * time.Second
 		} else {
 			log.Printf("Invalid POLL_INTERVAL value: %s, using default\n", envPoll)
 		}
@@ -129,8 +143,8 @@ func main() {
 
 	a := agent.New(
 		endpoint,
-		time.Duration(*pollInterval)*time.Second,
-		time.Duration(*reportInterval)*time.Second,
+		*pollInterval,
+		*reportInterval,
 		*batchSize,
 		*key,
 		*rateLimit,
