@@ -2,10 +2,14 @@
 // a JSON file or in memory. The endpoints are described in
 // [github.com/rebusman/svcmetrics/internal/handler].
 //
+// With -crypto-key or CRYPTO_KEY, load a PEM RSA private key for request encryption.
+// CRYPTO_KEY overrides the flag; an invalid key stops startup.
+//
 // Usage:
 //
 //	server [flags]
 //
+// JSON settings from -c/-config or CONFIG provide defaults for flags.
 // Every setting comes from a flag, and an environment variable that is set
 // overrides it:
 //
@@ -19,6 +23,7 @@
 //	                                metrics live in the database and the file is
 //	                                not used
 //	-k           KEY                key for HMAC-SHA256 signatures
+//	-crypto-key  CRYPTO_KEY         path to a PEM RSA private key
 //	-audit-file  AUDIT_FILE         file the audit log is appended to
 //	-audit-url   AUDIT_URL          URL the audit events are posted to
 //
@@ -30,7 +35,7 @@
 // Each audit receiver that is configured gets an event for every request
 // whose metrics were stored: their names, the time and the client address.
 //
-// SIGINT and SIGTERM stop the server gracefully: it lets the requests in
+// SIGINT, SIGTERM and SIGQUIT stop the server gracefully: it lets the requests in
 // flight finish, delivers the queued audit events and saves the metrics to the
 // file before it exits.
 package main
@@ -38,6 +43,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rsa"
 	"errors"
 	"flag"
 	"fmt"
@@ -52,6 +58,8 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rebusman/svcmetrics/internal/audit"
+	"github.com/rebusman/svcmetrics/internal/config"
+	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
@@ -208,14 +216,29 @@ func main() {
 	printBuildInfo(os.Stdout)
 
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
-	storeInterval := flag.Int("i", 300, "save interval in seconds")
+	storeInterval := config.Seconds(flag.CommandLine, "i", 300, "save interval (seconds or Go duration)")
 	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
 	restore := flag.Bool("r", false, "restore metrics from file on startup")
 	databaseDSN := flag.String("d", "", "PostgreSQL connection string (DSN)")
 	key := flag.String("k", "", "key for signing request and response bodies")
 	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
 	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
+	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
+	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
+	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"address":        "a",
+		"crypto_key":     "crypto-key",
+		"key":            "k",
+		"store_interval": "i",
+		"store_file":     "f",
+		"restore":        "r",
+		"database_dsn":   "d",
+		"audit_file":     "audit-file",
+		"audit_url":      "audit-url",
+	}); err != nil {
+		logrus.Fatal(err)
+	}
 
 	log := logrus.New()
 	log.SetFormatter(&logrus.TextFormatter{
@@ -231,11 +254,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid STORE_INTERVAL value %q: %v", envStoreInterval, err)
 		}
-		*storeInterval = v
+		*storeInterval = time.Duration(v) * time.Second
 	}
 
 	if envFileStoragePath := os.Getenv("FILE_STORAGE_PATH"); envFileStoragePath != "" {
 		*fileStoragePath = envFileStoragePath
+	}
+
+	if env := os.Getenv("STORE_FILE"); env != "" {
+		*fileStoragePath = env
 	}
 
 	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
@@ -257,6 +284,18 @@ func main() {
 	}
 	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
 		*auditURL = envAuditURL
+	}
+
+	if env := os.Getenv("CRYPTO_KEY"); env != "" {
+		*cryptoKey = env
+	}
+	var privateKey *rsa.PrivateKey
+	if *cryptoKey != "" {
+		var err error
+		privateKey, err = payloadcrypto.LoadPrivateKey(*cryptoKey)
+		if err != nil {
+			log.Fatalf("Failed to load crypto key: %v", err)
+		}
 	}
 
 	auditor, closeAudit, err := newAuditor(log, *auditFile, *auditURL)
@@ -311,10 +350,10 @@ func main() {
 		log.Info("Using in-memory storage")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key, auditor)
+	r := newRouter(log, hs, pinger, *key, auditor, privateKey)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -330,9 +369,11 @@ func main() {
 		}
 	}()
 
+	saverDone := make(chan struct{})
 	if fileStore != nil && *storeInterval > 0 {
 		go func() {
-			ticker := time.NewTicker(time.Duration(*storeInterval) * time.Second)
+			defer close(saverDone)
+			ticker := time.NewTicker(*storeInterval)
 			defer ticker.Stop()
 			for {
 				select {
@@ -345,6 +386,10 @@ func main() {
 				}
 			}
 		}()
+	}
+
+	if fileStore == nil || *storeInterval <= 0 {
+		close(saverDone)
 	}
 
 	<-ctx.Done()
@@ -364,6 +409,7 @@ func main() {
 	// closeAudit logs that.
 	closeAudit()
 
+	<-saverDone
 	if fileStore != nil {
 		saveCtx, cancel := context.WithTimeout(context.Background(), storageSaveTimeout)
 		if err := fileStore.Save(saveCtx, *fileStoragePath); err != nil {

@@ -1,7 +1,7 @@
 // Package agent collects metrics and reports them to the metrics server in
-// gzip-compressed batches. An agent configured with a key signs the compressed
-// request body and puts the digest in [hashing.Header]; an agent without one
-// sends no signature at all.
+// gzip-compressed batches, optionally encrypted with a public RSA key.
+// With an HMAC key, it signs the transmitted body (after encryption, if enabled)
+// and puts the digest in [hashing.Header].
 //
 // Collecting and reporting run apart: two collectors — one reading the Go
 // runtime, one reading the host through gopsutil — write into the shared
@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"io"
 	"math/rand/v2"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/pool"
@@ -88,6 +90,7 @@ type Agent struct {
 	batchSize      int
 	rateLimit      int
 	key            string
+	publicKey      *rsa.PublicKey
 
 	// retry governs the reports only: reading the runtime cannot fail in a way
 	// a repetition would fix, and a host statistic that could not be read is
@@ -146,6 +149,11 @@ func New(endpoint string, pollInterval, reportInterval time.Duration, batchSize 
 	}
 }
 
+// SetPublicKey configures encryption of compressed request bodies with key.
+// A nil key disables encryption. Call SetPublicKey before [Agent.Run] or any
+// reporting begins; it must not run concurrently with reporting.
+func (a *Agent) SetPublicKey(key *rsa.PublicKey) { a.publicKey = key }
+
 // SetOnRetry installs fn as the observer of the repeated reports, so the
 // caller can log the failures the agent recovers from.
 func (a *Agent) SetOnRetry(fn retry.OnRetry) {
@@ -166,40 +174,51 @@ func (a *Agent) reportError(err error) {
 	}
 }
 
-// Run collects and reports metrics until the context is cancelled, and returns
-// once every goroutine it started has stopped.
-//
-// The collectors, the reporter and the workers are separate goroutines joined
-// by a single channel of batches. Run drives the reporter itself and blocks,
-// as it did when all of this happened in one loop.
-//
-// The workers and the collectors stop on different signals — the workers when
-// the channel of batches closes, the collectors when the context is cancelled —
-// and neither has to outlive the other. A single [sync.WaitGroup] holds them
-// all, so the two kinds are joined at once rather than one pool after the
-// other, and nothing a worker does delays a collector's completion.
+// Run stops collecting on cancellation, finishes in-flight reports and sends
+// the remaining metrics before returning. Delivery gets a separate shutdown
+// budget so the signal does not cancel requests already being processed.
 func (a *Agent) Run(ctx context.Context) {
 	batches := make(chan []models.Metrics)
+	deliveryCtx, cancelDelivery := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelDelivery()
+	shutdownDone := make(chan struct{})
+	defer close(shutdownDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-shutdownDone:
+			return
+		}
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancelDelivery()
+		case <-shutdownDone:
+		}
+	}()
 
-	var running sync.WaitGroup
+	var workers, collectors sync.WaitGroup
 	for range a.rateLimit {
-		running.Go(func() {
-			a.work(ctx, batches)
-		})
+		workers.Go(func() { a.work(deliveryCtx, batches) })
 	}
-	running.Go(func() {
-		a.poll(ctx, a.collectRuntime)
-	})
-	running.Go(func() {
-		a.poll(ctx, a.CollectSystemMetrics)
-	})
+	collectors.Go(func() { a.poll(ctx, a.collectRuntime) })
+	collectors.Go(func() { a.poll(ctx, a.CollectSystemMetrics) })
 
 	a.report(ctx, batches)
-
-	// Only the reporter sends, so it is the one that may close the channel;
-	// the workers then finish what they are already holding and stop.
+	collectors.Wait()
 	close(batches)
-	running.Wait()
+	workers.Wait()
+
+	// Failed reports have returned their counter deltas by now. Include them
+	// together with everything collected since the last periodic report.
+	flush := make(chan []models.Metrics)
+	for range a.rateLimit {
+		workers.Go(func() { a.work(deliveryCtx, flush) })
+	}
+	a.enqueue(deliveryCtx, flush)
+	close(flush)
+	workers.Wait()
 }
 
 // collectRuntime adapts [Agent.CollectRuntimeMetrics] to the signature poll
@@ -226,7 +245,7 @@ func (a *Agent) poll(ctx context.Context, collect func(context.Context) error) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := collect(ctx); err != nil {
+			if err := collect(context.WithoutCancel(ctx)); err != nil {
 				a.reportError(err)
 			}
 		}
@@ -447,14 +466,14 @@ func (a *Agent) returnCounters(metrics []models.Metrics) {
 	}
 }
 
-// sendBatch posts one gzip-compressed batch to /updates/. When the agent has a
-// key, the complete compressed body is signed and the digest goes into
-// [hashing.Header] — the server verifies the request before it decompresses
-// it, so the JSON behind the gzip is the wrong thing to sign. An empty batch is
-// never sent. The
-// buffer and the compressor come from a pool and are reset before they are
-// returned, after the response body is closed; the response body is drained so the transport can reuse the connection for the
-// next batch.
+// sendBatch posts one gzip-compressed batch to /updates/. An empty batch is
+// never sent. With a public key configured by [Agent.SetPublicKey], it encrypts
+// the compressed body before signing it with the HMAC key, if configured.
+// The digest in [hashing.Header] covers the transmitted bytes; the server
+// verifies the signature, decrypts the payload and decompresses it in that order.
+//
+// The buffer and compressor are pooled. The response body is drained and closed
+// before they are returned so the transport can reuse the connection.
 func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
@@ -473,6 +492,13 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 		return err
 	}
 	body := enc.buf.Bytes()
+	if a.publicKey != nil {
+		encrypted, err := payloadcrypto.Encrypt(a.publicKey, body)
+		if err != nil {
+			return err
+		}
+		body = encrypted
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.updatesURL, bytes.NewReader(body))
 	if err != nil {
@@ -480,6 +506,9 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+	if a.publicKey != nil {
+		req.Header.Set(payloadcrypto.Header, payloadcrypto.Algorithm)
+	}
 	// The response body is thrown away unread, so a compressed one would only
 	// cost the server a compressor and the agent a decompressor.
 	req.Header.Set("Accept-Encoding", "identity")
