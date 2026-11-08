@@ -226,6 +226,12 @@ func main() {
 	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
 	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
+
+	log := logrus.New()
+	log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
 	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
 		"address":        "a",
 		"crypto_key":     "crypto-key",
@@ -237,13 +243,8 @@ func main() {
 		"audit_file":     "audit-file",
 		"audit_url":      "audit-url",
 	}); err != nil {
-		logrus.Fatal(err)
+		log.Fatal(err)
 	}
-
-	log := logrus.New()
-	log.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp: true,
-	})
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr

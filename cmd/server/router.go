@@ -72,20 +72,18 @@ const (
 // The signature middleware sits between the logger and the compression pair on
 // purpose: outside compression, so the digest covers the bytes that actually
 // travel; inside logging, so a request rejected over a bad signature still
-// reaches the log. The first optional cryptoKeys entry enables request
+// reaches the log. A non-nil privateKey enables request
 // decryption between signature verification and gzip decompression.
-func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string, auditor handler.Auditor, cryptoKeys ...*rsa.PrivateKey) chi.Router {
+func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string, auditor handler.Auditor, privateKey *rsa.PrivateKey) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 	r.Use(loggingMiddleware(log))
 	r.Use(handler.HashMiddleware(key))
-	var privateKey *rsa.PrivateKey
-	if len(cryptoKeys) > 0 {
-		privateKey = cryptoKeys[0]
+	if privateKey != nil {
+		r.Use(handler.DecryptMiddleware(privateKey))
 	}
-	r.Use(handler.DecryptMiddleware(privateKey))
 	r.Use(handler.GzipRequestMiddleware)
 	r.Use(handler.GzipResponseMiddleware)
 

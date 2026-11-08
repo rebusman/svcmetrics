@@ -40,6 +40,9 @@ const (
 	defaultReportInterval = 10 * time.Second
 	clientTimeout         = 5 * time.Second
 
+	// shutdownTimeout bounds delivery of in-flight and remaining reports after cancellation.
+	shutdownTimeout = 30 * time.Second
+
 	// DefaultBatchSize is how many metrics go into one POST /updates/ request
 	// unless the caller configures something else.
 	DefaultBatchSize = 32
@@ -189,7 +192,7 @@ func (a *Agent) Run(ctx context.Context) {
 		case <-shutdownDone:
 			return
 		}
-		timer := time.NewTimer(30 * time.Second)
+		timer := time.NewTimer(shutdownTimeout)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -245,7 +248,7 @@ func (a *Agent) poll(ctx context.Context, collect func(context.Context) error) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := collect(context.WithoutCancel(ctx)); err != nil {
+			if err := collect(ctx); err != nil {
 				a.reportError(err)
 			}
 		}
