@@ -2,10 +2,14 @@
 // server in gzip-compressed batches. The collection and reporting are
 // described in [github.com/rebusman/svcmetrics/internal/agent].
 //
+// With -crypto-key or CRYPTO_KEY, load a PEM RSA public key for request encryption.
+// CRYPTO_KEY overrides the flag; an invalid key stops startup.
+//
 // Usage:
 //
 //	agent [flags]
 //
+// JSON settings from -c/-config or CONFIG provide defaults for flags.
 // Every setting comes from a flag, and an environment variable that is set
 // overrides it:
 //
@@ -16,15 +20,18 @@
 //	-b  BATCH_SIZE       metrics per request (32)
 //	-l  RATE_LIMIT       requests in flight at once (1)
 //	-k  KEY              key for HMAC-SHA256 signatures
+//	-crypto-key  CRYPTO_KEY         path to a PEM RSA public key
 //
 // With a key, every request body is signed as sent, after compression, and the
-// hexadecimal digest travels in the HashSHA256 header.
+// hexadecimal digest travels in the HashSHA256 header. When encryption is
+// enabled, the signature covers the encrypted body.
 //
-// SIGINT and SIGTERM stop the agent.
+// SIGINT, SIGTERM and SIGQUIT stop the agent.
 package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"flag"
 	"log"
 	"os"
@@ -35,6 +42,8 @@ import (
 	"time"
 
 	"github.com/rebusman/svcmetrics/internal/agent"
+	"github.com/rebusman/svcmetrics/internal/config"
+	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
 )
 
 // logRetry reports a failed report that the agent is about to repeat, so that
@@ -55,12 +64,36 @@ func main() {
 	printBuildInfo(os.Stdout)
 
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
-	reportInterval := flag.Int("r", 10, "report interval in seconds")
-	pollInterval := flag.Int("p", 2, "poll interval in seconds")
+	reportInterval := config.Seconds(flag.CommandLine, "r", 10, "report interval (seconds or Go duration)")
+	pollInterval := config.Seconds(flag.CommandLine, "p", 2, "poll interval (seconds or Go duration)")
 	batchSize := flag.Int("b", agent.DefaultBatchSize, "number of metrics per batch request")
 	rateLimit := flag.Int("l", agent.DefaultRateLimit, "maximum number of concurrent requests to the server")
 	key := flag.String("k", "", "key for signing request bodies")
+	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA public key")
+	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
+	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"address":         "a",
+		"crypto_key":      "crypto-key",
+		"key":             "k",
+		"report_interval": "r",
+		"poll_interval":   "p",
+		"batch_size":      "b",
+		"rate_limit":      "l",
+	}); err != nil {
+		log.Fatal(err)
+	}
+	if env := os.Getenv("CRYPTO_KEY"); env != "" {
+		*cryptoKey = env
+	}
+	var publicKey *rsa.PublicKey
+	if *cryptoKey != "" {
+		var err error
+		publicKey, err = payloadcrypto.LoadPublicKey(*cryptoKey)
+		if err != nil {
+			log.Fatalf("Failed to load crypto key: %v", err)
+		}
+	}
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
@@ -68,7 +101,7 @@ func main() {
 
 	if envReport := os.Getenv("REPORT_INTERVAL"); envReport != "" {
 		if v, err := strconv.Atoi(envReport); err == nil {
-			*reportInterval = v
+			*reportInterval = time.Duration(v) * time.Second
 		} else {
 			log.Printf("Invalid REPORT_INTERVAL value: %s, using default\n", envReport)
 		}
@@ -76,7 +109,7 @@ func main() {
 
 	if envPoll := os.Getenv("POLL_INTERVAL"); envPoll != "" {
 		if v, err := strconv.Atoi(envPoll); err == nil {
-			*pollInterval = v
+			*pollInterval = time.Duration(v) * time.Second
 		} else {
 			log.Printf("Invalid POLL_INTERVAL value: %s, using default\n", envPoll)
 		}
@@ -105,17 +138,18 @@ func main() {
 		endpoint = "http://" + endpoint
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
 	a := agent.New(
 		endpoint,
-		time.Duration(*pollInterval)*time.Second,
-		time.Duration(*reportInterval)*time.Second,
+		*pollInterval,
+		*reportInterval,
 		*batchSize,
 		*key,
 		*rateLimit,
 	)
+	a.SetPublicKey(publicKey)
 	a.SetOnRetry(logRetry)
 	a.SetOnError(logError)
 	a.Run(ctx)

@@ -150,41 +150,78 @@ func TestRunCollectsAndReports(t *testing.T) {
 	}
 }
 
-// TestRunStopsOnCancelledContext verifies that a shutdown ends the agent even
-// while the workers are stuck on a server that never answers: Run must not
-// wait for the requests it can no longer deliver.
-func TestRunStopsOnCancelledContext(t *testing.T) {
-	blocked := make(chan struct{})
-
+// TestRunFinishesInFlightReport verifies that cancellation does not abort a
+// report the server is already processing.
+func TestRunFinishesInFlightReport(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once, onceRelease sync.Once
+	var delivered atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+		batch := readBatch(t, r)
+		once.Do(func() { close(started) })
 		select {
-		case <-blocked:
+		case <-release:
 		case <-r.Context().Done():
+			t.Error("in-flight request cancelled during shutdown")
+			return
 		}
+		for _, m := range batch {
+			if m.ID == models.PollCount && m.Delta != nil {
+				delivered.Add(*m.Delta)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
 	}))
-	// Releasing the handlers has to happen before Close waits for them.
 	defer ts.Close()
-	defer close(blocked)
+	defer func() { onceRelease.Do(func() { close(release) }) }()
 
-	a := New(ts.URL, time.Millisecond, time.Millisecond, 1, "", 2)
+	a := New(ts.URL, time.Hour, time.Millisecond, 1, "", 2)
 	a.client = ts.Client()
-	seed(a)
-
+	a.CollectRuntimeMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
-
+	defer cancel()
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		a.Run(ctx)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
+	go func() { a.Run(ctx); close(done) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("report did not start")
+	}
 	cancel()
-
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Run() did not return after the context was cancelled")
+		t.Fatal("Run returned before the in-flight report finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	onceRelease.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not finish")
+	}
+	if got := delivered.Load(); got != 1 {
+		t.Fatalf("delivered PollCount = %d, want 1", got)
+	}
+}
+
+func TestRunFlushesBeforeFirstReport(t *testing.T) {
+	var delivered atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, m := range readBatch(t, r) {
+			if m.ID == models.PollCount && m.Delta != nil {
+				delivered.Add(*m.Delta)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	a := New(ts.URL, time.Hour, time.Hour, 3, "", 2)
+	a.CollectRuntimeMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.Run(ctx)
+	if got := delivered.Load(); got != 1 {
+		t.Fatalf("delivered PollCount = %d, want 1", got)
 	}
 }
