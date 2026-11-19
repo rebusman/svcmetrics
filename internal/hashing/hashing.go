@@ -14,6 +14,10 @@ import (
 // compressed.
 const Header = "HashSHA256"
 
+// MetadataKey is [Header] as the gRPC API carries it; gRPC lowercases
+// metadata keys.
+const MetadataKey = "hashsha256"
+
 // NoSignature is the placeholder some clients put in [Header] instead of
 // omitting it when they have no key. It means the same as an absent header.
 const NoSignature = "none"

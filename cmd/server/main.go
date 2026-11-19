@@ -61,10 +61,12 @@ import (
 	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/config"
 	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
+	"github.com/rebusman/svcmetrics/internal/grpcserver"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/rebusman/svcmetrics/internal/retry"
+	"google.golang.org/grpc/credentials"
 )
 
 // responseWriter records the status code, the body size and the first failed
@@ -216,6 +218,9 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 func main() {
 	printBuildInfo(os.Stdout)
 
+	grpcAddress := flag.String("grpc-address", "", "gRPC host:port; empty disables gRPC")
+	grpcCert := flag.String("grpc-cert", "", "TLS certificate file for gRPC; empty means plaintext")
+	grpcKey := flag.String("grpc-key", "", "TLS private key file for gRPC")
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	storeInterval := config.Seconds(flag.CommandLine, "i", 300, "save interval (seconds or Go duration)")
 	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
@@ -235,6 +240,9 @@ func main() {
 	})
 
 	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"grpc_address":   "grpc-address",
+		"grpc_cert":      "grpc-cert",
+		"grpc_key":       "grpc-key",
 		"address":        "a",
 		"trusted_subnet": "t",
 		"crypto_key":     "crypto-key",
@@ -249,6 +257,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if env, ok := os.LookupEnv("GRPC_ADDRESS"); ok {
+		*grpcAddress = env
+	}
+	if env, ok := os.LookupEnv("GRPC_CERT"); ok {
+		*grpcCert = env
+	}
+	if env, ok := os.LookupEnv("GRPC_KEY"); ok {
+		*grpcKey = env
+	}
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
 	}
@@ -368,6 +385,47 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
+	var stopGRPC func()
+	if *grpcAddress != "" {
+		var creds credentials.TransportCredentials
+		if *grpcCert != "" || *grpcKey != "" {
+			var err error
+			if creds, err = credentials.NewServerTLSFromFile(*grpcCert, *grpcKey); err != nil {
+				log.Fatal(err)
+			}
+		}
+		listener, err := net.Listen("tcp", *grpcAddress)
+		if err != nil {
+			log.Fatal(err)
+		}
+		server := grpcserver.New(grpcserver.Options{
+			Storage:    hs,
+			Subnet:     subnet,
+			Creds:      creds,
+			Key:        *key,
+			PrivateKey: privateKey,
+			Auditor:    auditor,
+			Log:        log,
+			Timeout:    requestTimeout,
+		})
+		go func() {
+			if err := server.Serve(listener); err != nil {
+				log.Errorf("gRPC server failed: %v", err)
+				stop()
+			}
+		}()
+		stopGRPC = func() {
+			done := make(chan struct{})
+			go func() { server.GracefulStop(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(shutdownGrace):
+				server.Stop()
+				<-done
+			}
+		}
+	}
+
 	r := newRouter(log, hs, pinger, *key, auditor, privateKey, subnet)
 
 	srv := &http.Server{
@@ -416,6 +474,10 @@ func main() {
 	cancel()
 	if err != nil {
 		log.Errorf("Server shutdown failed: %v", err)
+	}
+
+	if stopGRPC != nil {
+		stopGRPC()
 	}
 
 	// The server no longer accepts requests, so no new events can appear:

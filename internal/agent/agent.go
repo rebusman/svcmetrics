@@ -90,6 +90,9 @@ type Agent struct {
 	updatesURL string
 	client     *http.Client
 
+	// grpcSend, when set, replaces the HTTP delivery.
+	grpcSend func(context.Context, []models.Metrics) error
+
 	pollInterval   time.Duration
 	reportInterval time.Duration
 	batchSize      int
@@ -482,6 +485,10 @@ func (a *Agent) returnCounters(metrics []models.Metrics) {
 func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil
+	}
+
+	if a.grpcSend != nil {
+		return a.grpcSend(ctx, metrics)
 	}
 
 	enc := batchEncoderPool.Get()
