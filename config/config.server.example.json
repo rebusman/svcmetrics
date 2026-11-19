@@ -1,5 +1,6 @@
 {
   "address": "localhost:8080",
+  "trusted_subnet": "",
   "store_interval": "300s",
   "store_file": "metrics.json",
   "restore": true,

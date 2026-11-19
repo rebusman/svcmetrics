@@ -23,6 +23,7 @@
 //	                                metrics live in the database and the file is
 //	                                not used
 //	-k           KEY                key for HMAC-SHA256 signatures
+//	-t           TRUSTED_SUBNET     trusted agent subnet (CIDR); empty disables filtering
 //	-crypto-key  CRYPTO_KEY         path to a PEM RSA private key
 //	-audit-file  AUDIT_FILE         file the audit log is appended to
 //	-audit-url   AUDIT_URL          URL the audit events are posted to
@@ -224,6 +225,7 @@ func main() {
 	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
 	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
 	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
+	trustedSubnet := flag.String("t", "", "trusted agent subnet in CIDR notation; empty disables filtering")
 	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -234,6 +236,7 @@ func main() {
 
 	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
 		"address":        "a",
+		"trusted_subnet": "t",
 		"crypto_key":     "crypto-key",
 		"key":            "k",
 		"store_interval": "i",
@@ -289,6 +292,17 @@ func main() {
 
 	if env := os.Getenv("CRYPTO_KEY"); env != "" {
 		*cryptoKey = env
+	}
+	if env, ok := os.LookupEnv("TRUSTED_SUBNET"); ok {
+		*trustedSubnet = env
+	}
+	var subnet *net.IPNet
+	if *trustedSubnet != "" {
+		var err error
+		_, subnet, err = net.ParseCIDR(*trustedSubnet)
+		if err != nil {
+			log.Fatalf("Invalid trusted_subnet %q: %v", *trustedSubnet, err)
+		}
 	}
 	var privateKey *rsa.PrivateKey
 	if *cryptoKey != "" {
@@ -354,7 +368,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key, auditor, privateKey)
+	r := newRouter(log, hs, pinger, *key, auditor, privateKey, subnet)
 
 	srv := &http.Server{
 		Addr:              *addr,

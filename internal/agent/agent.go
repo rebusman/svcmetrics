@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"runtime"
 	"slices"
 	"strings"
@@ -508,6 +510,15 @@ func (a *Agent) sendBatch(ctx context.Context, metrics []models.Metrics) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// GotConn runs before headers are written, including for reused connections.
+	// The local address identifies the interface used to reach this server.
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if addr, ok := info.Conn.LocalAddr().(*net.TCPAddr); ok {
+				req.Header.Set("X-Real-IP", addr.IP.String())
+			}
+		},
+	}))
 	req.Header.Set("Content-Encoding", "gzip")
 	if a.publicKey != nil {
 		req.Header.Set(payloadcrypto.Header, payloadcrypto.Algorithm)
