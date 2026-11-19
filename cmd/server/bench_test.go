@@ -39,7 +39,7 @@ func BenchmarkAgentReport(b *testing.B) {
 		_ = publisher.Close(ctx)
 	})
 
-	srv := httptest.NewServer(newRouter(log, repository.NewMemStorage(), nil, key, publisher))
+	srv := httptest.NewServer(newRouter(log, repository.NewMemStorage(), nil, key, publisher, nil))
 	b.Cleanup(srv.Close)
 
 	a := agent.New(srv.URL, time.Second, time.Second, 0, key, 0)

@@ -82,7 +82,7 @@ func newTestServer(t *testing.T, pinger interface {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	r := newRouter(log, repository.NewMemStorage(), pinger, "", nil)
+	r := newRouter(log, repository.NewMemStorage(), pinger, "", nil, nil)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv
@@ -117,7 +117,7 @@ func TestE2EPostgresStorageRoundTrip(t *testing.T) {
 
 	log := logrus.New()
 	log.SetOutput(io.Discard)
-	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil))
+	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil, nil))
 	t.Cleanup(srv.Close)
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -433,7 +433,7 @@ func TestE2EConcurrentCounterUpdatesArePersistedExactly(t *testing.T) {
 
 	log := logrus.New()
 	log.SetOutput(io.Discard)
-	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil))
+	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil, nil))
 	t.Cleanup(srv.Close)
 
 	const writers = 16
@@ -507,7 +507,7 @@ func TestE2EGzipRoundTripAgainstPostgres(t *testing.T) {
 
 	log := logrus.New()
 	log.SetOutput(io.Discard)
-	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil))
+	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil, nil))
 	t.Cleanup(srv.Close)
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -580,7 +580,7 @@ func TestE2EPingWithoutDatabase(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	srv := httptest.NewServer(newRouter(log, repository.NewMemStorage(), nil, "", nil))
+	srv := httptest.NewServer(newRouter(log, repository.NewMemStorage(), nil, "", nil, nil))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/ping")
@@ -614,7 +614,7 @@ func TestE2EGzippedBatchAgainstPostgres(t *testing.T) {
 
 	log := logrus.New()
 	log.SetOutput(io.Discard)
-	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil))
+	srv := httptest.NewServer(newRouter(log, pg, pg, "", nil, nil))
 	t.Cleanup(srv.Close)
 
 	client := &http.Client{Timeout: 5 * time.Second}
