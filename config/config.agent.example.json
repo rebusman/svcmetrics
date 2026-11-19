@@ -1,4 +1,6 @@
 {
+  "grpc_address": "",
+  "grpc_ca": "",
   "address": "http://localhost:8080",
   "report_interval": "10s",
   "poll_interval": "2s",

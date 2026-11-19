@@ -44,6 +44,7 @@ import (
 	"github.com/rebusman/svcmetrics/internal/agent"
 	"github.com/rebusman/svcmetrics/internal/config"
 	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
+	"google.golang.org/grpc/credentials"
 )
 
 // logRetry reports a failed report that the agent is about to repeat, so that
@@ -63,6 +64,8 @@ func logError(err error) {
 func main() {
 	printBuildInfo(os.Stdout)
 
+	grpcAddress := flag.String("grpc-address", "", "gRPC host:port; empty disables gRPC")
+	grpcCA := flag.String("grpc-ca", "", "CA certificate file to verify the gRPC server over TLS; empty means plaintext")
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	reportInterval := config.Seconds(flag.CommandLine, "r", 10, "report interval (seconds or Go duration)")
 	pollInterval := config.Seconds(flag.CommandLine, "p", 2, "poll interval (seconds or Go duration)")
@@ -73,6 +76,8 @@ func main() {
 	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
 	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"grpc_address":    "grpc-address",
+		"grpc_ca":         "grpc-ca",
 		"address":         "a",
 		"crypto_key":      "crypto-key",
 		"key":             "k",
@@ -95,6 +100,12 @@ func main() {
 		}
 	}
 
+	if env, ok := os.LookupEnv("GRPC_ADDRESS"); ok {
+		*grpcAddress = env
+	}
+	if env, ok := os.LookupEnv("GRPC_CA"); ok {
+		*grpcCA = env
+	}
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
 	}
@@ -150,6 +161,20 @@ func main() {
 		*rateLimit,
 	)
 	a.SetPublicKey(publicKey)
+	if *grpcAddress != "" {
+		var creds credentials.TransportCredentials
+		if *grpcCA != "" {
+			var err error
+			if creds, err = credentials.NewClientTLSFromFile(*grpcCA, ""); err != nil {
+				log.Fatal(err)
+			}
+		}
+		conn, err := a.ConfigureGRPC(*grpcAddress, creds)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+	}
 	a.SetOnRetry(logRetry)
 	a.SetOnError(logError)
 	a.Run(ctx)

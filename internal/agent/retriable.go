@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"syscall"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // statusError is the answer of a server that refused a batch. It carries the
@@ -33,6 +36,12 @@ func (e *statusError) Error() string {
 func isRetriableSendError(err error) bool {
 	if err == nil {
 		return false
+	}
+
+	var grpcErr interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &grpcErr) && grpcErr.GRPCStatus() != nil {
+		st := grpcErr.GRPCStatus()
+		return st.Code() == codes.Unavailable || st.Code() == codes.ResourceExhausted || st.Code() == codes.DeadlineExceeded
 	}
 
 	var statusErr *statusError

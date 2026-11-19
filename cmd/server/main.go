@@ -23,6 +23,7 @@
 //	                                metrics live in the database and the file is
 //	                                not used
 //	-k           KEY                key for HMAC-SHA256 signatures
+//	-t           TRUSTED_SUBNET     trusted agent subnet (CIDR); empty disables filtering
 //	-crypto-key  CRYPTO_KEY         path to a PEM RSA private key
 //	-audit-file  AUDIT_FILE         file the audit log is appended to
 //	-audit-url   AUDIT_URL          URL the audit events are posted to
@@ -60,10 +61,12 @@ import (
 	"github.com/rebusman/svcmetrics/internal/audit"
 	"github.com/rebusman/svcmetrics/internal/config"
 	payloadcrypto "github.com/rebusman/svcmetrics/internal/crypto"
+	"github.com/rebusman/svcmetrics/internal/grpcserver"
 	"github.com/rebusman/svcmetrics/internal/handler"
 	models "github.com/rebusman/svcmetrics/internal/model"
 	"github.com/rebusman/svcmetrics/internal/repository"
 	"github.com/rebusman/svcmetrics/internal/retry"
+	"google.golang.org/grpc/credentials"
 )
 
 // responseWriter records the status code, the body size and the first failed
@@ -215,6 +218,9 @@ func loggingMiddleware(log *logrus.Logger) func(http.Handler) http.Handler {
 func main() {
 	printBuildInfo(os.Stdout)
 
+	grpcAddress := flag.String("grpc-address", "", "gRPC host:port; empty disables gRPC")
+	grpcCert := flag.String("grpc-cert", "", "TLS certificate file for gRPC; empty means plaintext")
+	grpcKey := flag.String("grpc-key", "", "TLS private key file for gRPC")
 	addr := flag.String("a", "localhost:8080", "address and port to run server")
 	storeInterval := config.Seconds(flag.CommandLine, "i", 300, "save interval (seconds or Go duration)")
 	fileStoragePath := flag.String("f", "", "path to storage file; empty keeps the metrics in memory only")
@@ -224,6 +230,7 @@ func main() {
 	auditFile := flag.String("audit-file", "", "path to the audit log file; empty disables it")
 	auditURL := flag.String("audit-url", "", "URL the audit events are posted to; empty disables it")
 	cryptoKey := flag.String("crypto-key", "", "path to PEM RSA private key")
+	trustedSubnet := flag.String("t", "", "trusted agent subnet in CIDR notation; empty disables filtering")
 	configPath := config.FileFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -233,7 +240,11 @@ func main() {
 	})
 
 	if err := config.Apply(flag.CommandLine, *configPath, map[string]string{
+		"grpc_address":   "grpc-address",
+		"grpc_cert":      "grpc-cert",
+		"grpc_key":       "grpc-key",
 		"address":        "a",
+		"trusted_subnet": "t",
 		"crypto_key":     "crypto-key",
 		"key":            "k",
 		"store_interval": "i",
@@ -246,6 +257,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if env, ok := os.LookupEnv("GRPC_ADDRESS"); ok {
+		*grpcAddress = env
+	}
+	if env, ok := os.LookupEnv("GRPC_CERT"); ok {
+		*grpcCert = env
+	}
+	if env, ok := os.LookupEnv("GRPC_KEY"); ok {
+		*grpcKey = env
+	}
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		*addr = envAddr
 	}
@@ -289,6 +309,17 @@ func main() {
 
 	if env := os.Getenv("CRYPTO_KEY"); env != "" {
 		*cryptoKey = env
+	}
+	if env, ok := os.LookupEnv("TRUSTED_SUBNET"); ok {
+		*trustedSubnet = env
+	}
+	var subnet *net.IPNet
+	if *trustedSubnet != "" {
+		var err error
+		_, subnet, err = net.ParseCIDR(*trustedSubnet)
+		if err != nil {
+			log.Fatalf("Invalid trusted_subnet %q: %v", *trustedSubnet, err)
+		}
 	}
 	var privateKey *rsa.PrivateKey
 	if *cryptoKey != "" {
@@ -354,7 +385,48 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
-	r := newRouter(log, hs, pinger, *key, auditor, privateKey)
+	var stopGRPC func()
+	if *grpcAddress != "" {
+		var creds credentials.TransportCredentials
+		if *grpcCert != "" || *grpcKey != "" {
+			var err error
+			if creds, err = credentials.NewServerTLSFromFile(*grpcCert, *grpcKey); err != nil {
+				log.Fatal(err)
+			}
+		}
+		listener, err := net.Listen("tcp", *grpcAddress)
+		if err != nil {
+			log.Fatal(err)
+		}
+		server := grpcserver.New(grpcserver.Options{
+			Storage:    hs,
+			Subnet:     subnet,
+			Creds:      creds,
+			Key:        *key,
+			PrivateKey: privateKey,
+			Auditor:    auditor,
+			Log:        log,
+			Timeout:    requestTimeout,
+		})
+		go func() {
+			if err := server.Serve(listener); err != nil {
+				log.Errorf("gRPC server failed: %v", err)
+				stop()
+			}
+		}()
+		stopGRPC = func() {
+			done := make(chan struct{})
+			go func() { server.GracefulStop(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(shutdownGrace):
+				server.Stop()
+				<-done
+			}
+		}
+	}
+
+	r := newRouter(log, hs, pinger, *key, auditor, privateKey, subnet)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -402,6 +474,10 @@ func main() {
 	cancel()
 	if err != nil {
 		log.Errorf("Server shutdown failed: %v", err)
+	}
+
+	if stopGRPC != nil {
+		stopGRPC()
 	}
 
 	// The server no longer accepts requests, so no new events can appear:

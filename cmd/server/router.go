@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rsa"
+	"net"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -74,12 +75,15 @@ const (
 // travel; inside logging, so a request rejected over a bad signature still
 // reaches the log. A non-nil privateKey enables request
 // decryption between signature verification and gzip decompression.
-func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string, auditor handler.Auditor, privateKey *rsa.PrivateKey) chi.Router {
+func newRouter(log *logrus.Logger, hs repository.Storage, pinger handler.Pinger, key string, auditor handler.Auditor, privateKey *rsa.PrivateKey, subnets ...*net.IPNet) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.CleanPath)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 	r.Use(loggingMiddleware(log))
+	if len(subnets) > 0 {
+		r.Use(handler.TrustedSubnetMiddleware(subnets[0]))
+	}
 	r.Use(handler.HashMiddleware(key))
 	if privateKey != nil {
 		r.Use(handler.DecryptMiddleware(privateKey))

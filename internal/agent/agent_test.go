@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -18,6 +19,23 @@ import (
 	"github.com/rebusman/svcmetrics/internal/hashing"
 	models "github.com/rebusman/svcmetrics/internal/model"
 )
+
+func TestSendBatchRealIP(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(host).Equal(net.ParseIP(r.Header.Get("X-Real-IP"))) {
+			t.Errorf("X-Real-IP=%q, remote=%q", r.Header.Get("X-Real-IP"), r.RemoteAddr)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s.Close()
+	a := New(s.URL, 0, 0, 0, "", 1)
+	for range 2 {
+		if err := a.sendBatch(context.Background(), []models.Metrics{gaugeMetric("Alloc", 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 // readBatch decompresses a request body and decodes the batch it carries.
 func readBatch(t *testing.T, r *http.Request) []models.Metrics {
